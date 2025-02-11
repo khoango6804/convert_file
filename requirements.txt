@@ -1,0 +1,4 @@
+matplotlib
+seaborn
+pywin32
+python-docx
