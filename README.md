@@ -43,3 +43,6 @@ Lỗi	Nguyên nhân	Cách sửa
 No module named 'win32com'	Chưa cài pywin32	Chạy pip install pywin32
 FileNotFoundError	Đường dẫn sai	Kiểm tra đường dẫn file
 PermissionError	File đang mở	Đóng Microsoft Word trước khi chạy
+```
+**Bước cuối là chạy lại file check_fix.ipynb**
+Vì sẽ có những file doc,docs,DOC bị lỗi trong quá trình convert nên phải check lại là fix thủ công nếu cần
