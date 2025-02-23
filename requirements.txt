@@ -2,10 +2,7 @@ matplotlib
 seaborn
 pywin32
 python-docx
-easyocr
 Pillow
 PyMuPDF
---find-links https://download.pytorch.org/whl/cu126
-torch
-torchvision
-torchaudio
+google-genai
+tenacity
