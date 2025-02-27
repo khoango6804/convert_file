@@ -301,21 +301,13 @@ class PDFConverter:
 
             # Save as Markdown
             output_path = os.path.join(self.output_dir, f"{pdf_filename}.md")
-            original_path = os.path.join(self.output_dir, f"{pdf_filename}_original.md")
+            cleaned_text = self.clean_markdown_content(corrected_text)
 
-            # Clean and save both versions
-            cleaned_combined = self.clean_markdown_content(combined_text)
-            cleaned_corrected = self.clean_markdown_content(corrected_text)
-
-            with open(original_path, "w", encoding="utf-8") as f:
-                f.write(cleaned_combined)
             with open(output_path, "w", encoding="utf-8") as f:
-                f.write(cleaned_corrected)
+                f.write(cleaned_text)
 
-            print(f"✅ Đã lưu văn bản gốc: {original_path}")
-            print(f"✅ Đã lưu văn bản đã định dạng: {output_path}")
+            print(f"✅ Đã lưu văn bản: {output_path}")
 
-            pdf_document.close()
             return output_path
 
         except Exception as e:
