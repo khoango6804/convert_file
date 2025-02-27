@@ -107,36 +107,50 @@ class PDFConverter:
         """
         try:
             prompt = """
-            Nhiệm vụ: Chuẩn hóa văn bản Markdown và sửa lỗi chính tả tiếng Việt.
-            
-            Yêu cầu định dạng Markdown:
-            1. Cấu trúc tiêu đề:
-            - Chỉ một tiêu đề cấp 1 (#) ở đầu văn bản
-            - Sử dụng ## cho các tiêu đề phụ
-            - Không lặp lại tiêu đề cấp 1
+            Nhiệm vụ: Chuẩn hóa văn bản hành chính sang Markdown thuần túy.
 
-            2. Định dạng bảng:
-            - Căn chỉnh cột bảng
-            - Số liệu căn phải (:---)
-            - Văn bản căn trái (:---)
-            - Đảm bảo khoảng cách trong ô
+            Quy tắc định dạng:
+            1. Tiêu đề và cấu trúc:
+            - Chỉ MỘT tiêu đề # ở đầu văn bản cho tên cơ quan cao nhất
+            - Dùng ## cho tên cơ quan trực thuộc
+            - Dùng ### cho số văn bản và trích yếu (không có dấu : hoặc .)
+            - Thêm dòng trống trước và sau mỗi tiêu đề
+            - Không dùng tiêu đề trùng nội dung
+
+            2. Căn lề văn bản:
+            - Dùng hai dấu cách ở cuối dòng để xuống dòng thay vì HTML
+            - Sử dụng cú pháp Markdown thuần túy, không dùng <div>, <br>, <sup>
+            - Đối với nội dung căn giữa, thêm hai dấu cách ở cuối mỗi dòng
+            - Đối với nội dung căn phải, thêm bốn dấu cách ở đầu dòng
 
             3. Định dạng văn bản:
-            - Sửa các lỗi chính tả và dấu câu
-            - Chuẩn hóa khoảng cách
-            - Giữ nguyên các ký tự đặc biệt
-            - Kết thúc file với một dòng trống
+            - Dùng **CỘNG HÒA XÃ HỘI CHỦ NGHĨA VIỆT NAM**  
+            - Dùng *Độc lập - Tự do - Hạnh phúc*  
+            - Dùng *Hà Nội, ngày ... tháng ... năm ...*    
+            - Không dùng in đậm/nghiêng thay cho tiêu đề
 
-            4. Bảo toàn nội dung:
-            - Giữ nguyên các mã số văn bản
-            - Giữ nguyên các thuật ngữ chuyên ngành
-            - Không thay đổi ý nghĩa văn bản
-            - Không thêm các khối lệnh markdown
+            4. Danh sách và trích dẫn:
+            - Thêm dòng trống trước và sau danh sách
+            - Dùng - cho danh sách không thứ tự (thụt lề 3 dấu cách cho cấp con)
+            - Dùng 1. 2. 3. cho danh sách có thứ tự
+            - Dùng > cho trích dẫn (thêm dòng trống trước/sau)
+
+            5. Bảng và đường kẻ:
+            - Căn đều các cột trong bảng
+            - Sử dụng --- cho đường kẻ ngang (có dòng trống trước/sau)
+            - Đảm bảo số cột nhất quán trong bảng
+            - Sử dụng :--- cho căn trái, ---: cho căn phải
+
+            6. Ghi chú và footnote:
+            - Thay <sup>n</sup> bằng [^n]
+            - Đặt ghi chú cuối trang với [^n]: nội dung
+            - Thêm dòng trống trước mỗi ghi chú
 
             Lưu ý:
-            - Không bao gồm dấu ``` hoặc ```markdown
-            - Không thêm thông tin không cần thiết
-            - Đảm bảo văn bản kết thúc với một dòng trống
+            - Không sử dụng bất kỳ thẻ HTML nào
+            - Không để dấu câu ở cuối tiêu đề
+            - Đảm bảo khoảng cách nhất quán
+            - Kết thúc file với một dòng trống
             """
 
             # Get response from Gemini

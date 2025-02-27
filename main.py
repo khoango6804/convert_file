@@ -1,3 +1,4 @@
+import time
 import os
 import sys
 import json
@@ -5,7 +6,6 @@ from typing import List, Tuple
 
 from utils.doc_converter import extract_text_from_doc, extract_text_from_docx
 from utils.file_utils import ensure_folder_exists, move_to_error_folder
-from utils.file_visualizer import visualize_data
 from utils.pdf_converter import PDFConverter
 
 
@@ -61,68 +61,114 @@ def check_input_files(input_folder: str, error_folder: str) -> Tuple[List[str], 
     return [], False
 
 
-def process_files(files: List[str], output_folder: str, error_folder: str) -> None:
-    """Process files and handle errors"""
+def process_files(
+    files: List[str], output_folder: str, error_folder: str
+) -> Tuple[dict, List[str], List[str]]:
+    """
+    Process files and handle errors
+    Returns:
+        Tuple containing:
+        - Dictionary of file types and counts
+        - List of successfully processed files
+        - List of error files
+    """
     pdf_converter = None
     log_file = os.path.join(error_folder, "error_log.txt")
+    file_types = {"pdf": 0, "doc": 0, "docx": 0}
+    processed_files = []
+    error_files = []
+
+    # Track processed files to avoid duplicates
+    processed_file_paths = set()
 
     try:
         pdf_converter = PDFConverter()
 
+        # Clear previous log file content
         with open(log_file, "w", encoding="utf-8") as log:
-            for input_path in files:
-                file = os.path.basename(input_path)
-                file_lower = file.lower()
+            log.write(f"# Error Log - {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
 
-                try:
-                    # Skip temporary files
-                    if file_lower.startswith("~$"):
-                        continue
+        for input_path in files:
+            # Skip if already processed
+            if input_path in processed_file_paths:
+                continue
 
-                    # Define output path and processing function
-                    if file_lower.endswith(".pdf"):
-                        output_path = os.path.join(
-                            output_folder, f"{os.path.splitext(file)[0]}.md"
-                        )
-                        result = pdf_converter.pdf_to_text(
-                            input_path, output_format="md"
-                        )
-                        if not result:
-                            raise Exception("Không thể chuyển đổi PDF sang Markdown")
+            processed_file_paths.add(input_path)
+            file = os.path.basename(input_path)
+            file_lower = file.lower()
+
+            # Count file types
+            if file_lower.endswith(".pdf"):
+                file_types["pdf"] += 1
+            elif file_lower.endswith(".docx"):
+                file_types["docx"] += 1
+            elif file_lower.endswith(".doc"):
+                file_types["doc"] += 1
+
+            try:
+                # Skip temporary files
+                if file_lower.startswith("~$"):
+                    continue
+
+                # Define output path
+                output_path = os.path.join(
+                    output_folder, f"{os.path.splitext(file)[0]}.md"
+                )
+
+                # Check for and remove existing original markdown file
+                original_md_path = os.path.join(
+                    output_folder, f"{os.path.splitext(file)[0]}_original.md"
+                )
+                if os.path.exists(original_md_path):
+                    os.remove(original_md_path)
+
+                # Process based on file type
+                if file_lower.endswith(".pdf"):
+                    result = pdf_converter.pdf_to_text(input_path, output_format="md")
+                    if not result:
+                        raise Exception("Không thể chuyển đổi PDF sang Markdown")
+                else:
+                    # Handle DOC/DOCX
+                    extract_func = (
+                        extract_text_from_docx
+                        if file_lower.endswith(".docx")
+                        else extract_text_from_doc
+                    )
+
+                    text = extract_func(input_path)
+                    if text:
+                        # Write directly to final output file
+                        with open(output_path, "w", encoding="utf-8") as md_file:
+                            md_file.write(text)
                     else:
-                        # Handle DOC/DOCX
-                        output_path = os.path.join(
-                            output_folder,
-                            file.replace(".docx", ".md").replace(".doc", ".md"),
-                        )
-                        extract_func = (
-                            extract_text_from_docx
-                            if file_lower.endswith(".docx")
-                            else extract_text_from_doc
-                        )
+                        raise Exception("Không thể trích xuất nội dung")
 
-                        text = extract_func(input_path)
-                        if text:
-                            # Convert to Markdown format
-                            markdown_text = f"""# {os.path.splitext(file)[0]}
-                            {text}
-                            """
-                            with open(output_path, "w", encoding="utf-8") as md_file:
-                                md_file.write(markdown_text)
-                        else:
-                            raise Exception("Không thể trích xuất nội dung")
+                print(f"✅ Đã xử lý: {file}")
+                processed_files.append(file)
 
-                    print(f"✅ Đã xử lý: {file}")
+                # No longer deleting original files
+                # Only note successful processing
+                if os.path.dirname(input_path) == error_folder:
+                    print(f"✅ Đã xử lý file từ thư mục error: {file}")
 
-                except Exception as e:
-                    error_msg = f"❌ Lỗi xử lý {file}: {str(e)}"
-                    print(error_msg)
-                    log.write(f"{error_msg}\n")
-                    move_to_error_folder(input_path, error_folder)
+            except Exception as e:
+                error_msg = f"❌ Lỗi xử lý {file}: {str(e)}"
+                print(error_msg)
+
+                # Append to log with timestamp
+                with open(log_file, "a", encoding="utf-8") as log:
+                    log.write(f"## {time.strftime('%H:%M:%S')} - {file}\n")
+                    log.write(f"{str(e)}\n\n")
+
+                move_to_error_folder(input_path, error_folder)
+                if file not in error_files:
+                    error_files.append(file)
 
     finally:
         if pdf_converter:
             pdf_converter.cleanup()
+
+    return file_types, processed_files, error_files
 
 
 def create_api_json():
@@ -204,24 +250,62 @@ def main():
         total_files = len(valid_files)
         print(f"\n🔄 Bắt đầu xử lý {total_files} files từ {source_folder}...")
 
-        process_files(valid_files, output_folder, error_folder)
+        # Get file statistics from process_files
+        file_types, processed_files, error_files = process_files(
+            valid_files, output_folder, error_folder
+        )
         print("\n✅ Hoàn tất xử lý files")
 
-        # 4. Generate visualization
-        print("\n📊 Đang tạo biểu đồ thống kê...")
-        visualize_data(input_folder, output_folder, error_folder)
-        print("✅ Đã tạo xong biểu đồ")
+        # 4. Generate report
+        print("\n" + "=" * 50)
+        print("📊 BÁO CÁO XỬ LÝ FILES")
+        print("=" * 50)
 
-        # 5. Show summary
-        error_files = [f for f in os.listdir(error_folder) if not f.endswith(".md")]
-        print("\n📋 Tổng kết:")
-        print(f"- Tổng số file xử lý: {total_files}")
-        print(f"- Số file thành công: {total_files - len(error_files)}")
-        print(f"- Số file lỗi: {len(error_files)}")
+        # Read error log and store details
+        error_details = {}
+        error_log_path = os.path.join(error_folder, "error_log.txt")
+        if os.path.exists(error_log_path):
+            with open(error_log_path, "r", encoding="utf-8") as log:
+                for line in log:
+                    if "❌ Lỗi xử lý" in line:
+                        file_name = line.split("❌ Lỗi xử lý")[1].split(":")[0].strip()
+                        error_msg = line.split(":", 1)[1].strip()
+                        error_details[file_name] = error_msg
 
-        if len(error_files) > 0:
-            print(f"\n⚠️ Các file lỗi được chuyển vào: {error_folder}")
-            print("ℹ️ Xem chi tiết lỗi trong file: error_log.txt")
+        # Print statistics
+        print("\n📁 TỔNG QUAN")
+        print(f"- Nguồn xử lý: {source_folder}")
+        print(f"- Tổng số file: {total_files}")
+
+        print("\n📊 PHÂN LOẠI")
+        print("- Định dạng file:")
+        for ext, count in file_types.items():
+            if count > 0:
+                print(f"  • {ext.upper()}: {count} files")
+
+        print("\n📈 KẾT QUẢ")
+        success_count = len(processed_files)
+        error_count = len(error_files)
+        print(
+            f"- Thành công: {success_count} files ({success_count / total_files * 100:.1f}%)"
+        )
+        print(
+            f"- Thất bại: {error_count} files ({error_count / total_files * 100:.1f}%)"
+        )
+
+        if error_files:
+            print("\n❌ CHI TIẾT LỖI")
+            for file in error_files:
+                error_msg = error_details.get(file, "Không có thông tin lỗi")
+                print(f"- {file}")
+                print(f"  → {error_msg}")
+
+        print("\n" + "=" * 50)
+        if error_count > 0:
+            print(f"⚠️ Xem chi tiết lỗi trong: {error_log_path}")
+            print(f"📁 Files lỗi được chuyển vào: {error_folder}")
+        else:
+            print("✅ Tất cả files đã được xử lý thành công!")
 
         return 0
 
