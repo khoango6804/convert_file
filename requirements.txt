@@ -2,3 +2,7 @@ matplotlib
 seaborn
 pywin32
 python-docx
+Pillow
+PyMuPDF
+google-genai
+tenacity
