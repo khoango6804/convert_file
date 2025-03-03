@@ -35,7 +35,7 @@ class PDFConverter:
         )
         self.retry_count = 0
         self.max_retries = 3
-        self.wait_time = 10  # seconds
+        self.wait_time = 3600  # seconds
 
     @retry(
         stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10)
