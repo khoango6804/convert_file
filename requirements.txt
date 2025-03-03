@@ -1,8 +1,8 @@
 matplotlib
 seaborn
-pywin32==308
+pywin32
 python-docx
 Pillow
-PyMuPDF==1.25.3
-google-genai==1.2.0
-tenacity==9.0.0
+PyMuPDF
+google-genai
+tenacity
