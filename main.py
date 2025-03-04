@@ -3,6 +3,7 @@ import os
 import sys
 import json
 from typing import List, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from utils.doc_converter import extract_text_from_doc, extract_text_from_docx
 from utils.file_utils import (
@@ -86,6 +87,85 @@ def check_input_files(
     return [], False
 
 
+def process_file(
+    input_path, output_folder, error_folder, processed_folder, pdf_converter, log_file
+):
+    """Process a single file and handle errors"""
+    file = os.path.basename(input_path)
+    file_lower = file.lower()
+    processed_file_paths = set()
+    file_types = {"pdf": 0, "doc": 0, "docx": 0}
+    processed_files = []
+    error_files = []
+
+    # Count file types
+    if file_lower.endswith(".pdf"):
+        file_types["pdf"] += 1
+    elif file_lower.endswith(".docx"):
+        file_types["docx"] += 1
+    elif file_lower.endswith(".doc"):
+        file_types["doc"] += 1
+
+    try:
+        # Skip temporary files
+        if file_lower.startswith("~$"):
+            return file_types, processed_files, error_files
+
+        # Define output path
+        output_path = os.path.join(output_folder, f"{os.path.splitext(file)[0]}.md")
+
+        # Check for and remove existing original markdown file
+        original_md_path = os.path.join(
+            output_folder, f"{os.path.splitext(file)[0]}_original.md"
+        )
+        if os.path.exists(original_md_path):
+            os.remove(original_md_path)
+
+        # Process based on file type
+        if file_lower.endswith(".pdf"):
+            result = pdf_converter.pdf_to_text(input_path, output_format="md")
+            if not result:
+                raise Exception("Không thể chuyển đổi PDF sang Markdown")
+        else:
+            # Handle DOC/DOCX
+            extract_func = (
+                extract_text_from_docx
+                if file_lower.endswith(".docx")
+                else extract_text_from_doc
+            )
+            text = extract_func(input_path)
+            if text:
+                # Write directly to final output file
+                with open(output_path, "w", encoding="utf-8") as md_file:
+                    md_file.write(text)
+            else:
+                raise Exception("Không thể trích xuất nội dung")
+
+        print(f"✅ Đã xử lý: {file}")
+        processed_files.append(file)
+
+        # Move processed files to a processed folder
+        move_to_processed_folder(input_path, processed_folder)
+
+        if os.path.dirname(input_path) == error_folder:
+            print(f"✅ Đã xử lý file từ thư mục error: {file}")
+
+    except Exception as e:
+        error_msg = f"❌ Lỗi xử lý {file}: {str(e)}"
+        print(error_msg)
+
+        # Append to log with timestamp
+        with open(log_file, "a", encoding="utf-8") as log:
+            log.write(f"## {time.strftime('%H:%M:%S')} - {file}\n")
+            log.write(f"{str(e)}\n\n")
+
+        move_to_error_folder(input_path, error_folder)
+        if file not in error_files:
+            error_files.append(file)
+
+    return file_types, processed_files, error_files
+
+
 def process_files(
     files: List[str], output_folder: str, error_folder: str, processed_folder: str
 ) -> Tuple[dict, List[str], List[str]]:
@@ -97,106 +177,40 @@ def process_files(
         - List of successfully processed files
         - List of error files
     """
-    pdf_converter = None
+    pdf_converter = PDFConverter()
     log_file = os.path.join(error_folder, "error_log.txt")
     file_types = {"pdf": 0, "doc": 0, "docx": 0}
     processed_files = []
     error_files = []
 
-    # Track processed files to avoid duplicates
-    processed_file_paths = set()
+    # Clear previous log file content
+    with open(log_file, "w", encoding="utf-8") as log:
+        log.write(f"# Error Log - {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
 
-    try:
-        pdf_converter = PDFConverter()
-
-        # Clear previous log file content
-        with open(log_file, "w", encoding="utf-8") as log:
-            log.write(f"# Error Log - {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-
-        for input_path in files:
-            # Skip if already processed
-            if input_path in processed_file_paths:
-                continue
-
-            processed_file_paths.add(input_path)
-            file = os.path.basename(input_path)
-            file_lower = file.lower()
-
-            # Count file types
-            if file_lower.endswith(".pdf"):
-                file_types["pdf"] += 1
-            elif file_lower.endswith(".docx"):
-                file_types["docx"] += 1
-            elif file_lower.endswith(".doc"):
-                file_types["doc"] += 1
-
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [
+            executor.submit(
+                process_file,
+                input_path,
+                output_folder,
+                error_folder,
+                processed_folder,
+                pdf_converter,
+                log_file,
+            )
+            for input_path in files
+        ]
+        for future in as_completed(futures):
             try:
-                # Skip temporary files
-                if file_lower.startswith("~$"):
-                    continue
-
-                # Define output path
-                output_path = os.path.join(
-                    output_folder, f"{os.path.splitext(file)[0]}.md"
-                )
-
-                # Check for and remove existing original markdown file
-                original_md_path = os.path.join(
-                    output_folder, f"{os.path.splitext(file)[0]}_original.md"
-                )
-                if os.path.exists(original_md_path):
-                    os.remove(original_md_path)
-
-                # Process based on file type
-                if file_lower.endswith(".pdf"):
-                    result = pdf_converter.pdf_to_text(input_path, output_format="md")
-                    if not result:
-                        raise Exception("Không thể chuyển đổi PDF sang Markdown")
-                else:
-                    # Handle DOC/DOCX
-                    extract_func = (
-                        extract_text_from_docx
-                        if file_lower.endswith(".docx")
-                        else extract_text_from_doc
-                    )
-
-                    text = extract_func(input_path)
-                    if text:
-                        # Write directly to final output file
-                        with open(output_path, "w", encoding="utf-8") as md_file:
-                            md_file.write(text)
-                    else:
-                        raise Exception("Không thể trích xuất nội dung")
-
-                print(f"✅ Đã xử lý: {file}")
-                processed_files.append(file)
-
-                # Add this: Move processed files to a processed folder
-                processed_folder = os.path.join(
-                    os.path.dirname(output_folder), "processed"
-                )
-                move_to_processed_folder(input_path, processed_folder)
-
-                if os.path.dirname(input_path) == error_folder:
-                    print(f"✅ Đã xử lý file từ thư mục error: {file}")
-
+                file_type, processed, errors = future.result()
+                for key in file_types:
+                    file_types[key] += file_type.get(key, 0)
+                processed_files.extend(processed)
+                error_files.extend(errors)
             except Exception as e:
-                error_msg = f"❌ Lỗi xử lý {file}: {str(e)}"
-                print(error_msg)
+                print(f"❌ Lỗi xử lý file: {str(e)}")
 
-                # Append to log with timestamp
-                with open(log_file, "a", encoding="utf-8") as log:
-                    log.write(f"## {time.strftime('%H:%M:%S')} - {file}\n")
-                    log.write(f"{str(e)}\n\n")
-
-                move_to_error_folder(input_path, error_folder)
-                if file not in error_files:
-                    error_files.append(file)
-
-    finally:
-        if pdf_converter:
-            pdf_converter.cleanup()
-
+    pdf_converter.cleanup()
     return file_types, processed_files, error_files
 
 
