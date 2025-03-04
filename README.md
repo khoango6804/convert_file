@@ -1,53 +1,66 @@
-# 📝 Word to TXT Converter & Data Visualization
+# File Converter Tool
 
-## 📌 Giới thiệu
+A simple utility to convert files between different formats.
 
-Chương trình này giúp **chuyển đổi file Word (`.doc` & `.docx`) sang `.txt`**,
-quản lý file lỗi, **thống kê số lượng file**, và **visualize dữ liệu** bằng biểu đồ.
+## Features
 
-## 🛠 Tính năng chính
+- Convert between various file formats
+- Easy-to-use command line interface
+- Batch processing capabilities
+- Preserves metadata during conversion
 
-✅ **Chuyển đổi file Word (.doc, .docx) sang TXT**  
-✅ **Quản lý file lỗi**, tự động di chuyển vào thư mục riêng  
-✅ **Thống kê số lượng file, file lỗi, file trùng**  
-✅ **Visualize dữ liệu bằng biểu đồ Matplotlib & Seaborn**  
+## Installation
 
-## 📂 Cấu trúc thư mục
+```bash
+# Clone the repository
+git clone https://github.com/username/convert_file.git
 
-## 📥 Cài đặt
+# Navigate to the project directory
+cd convert_file
 
-**1️⃣ Cài đặt Python** (Nếu chưa có)  
-Tải và cài đặt Python từ [python.org](https://www.python.org/downloads/)
-
-**2️⃣ Cài đặt các thư viện cần thiết**  
-Chạy lệnh sau trong terminal/cmd:
-
-```sh
+# Install dependencies
 pip install -r requirements.txt
-
-🚀 Cách chạy chương trình
-Chạy lệnh sau để chuyển đổi file và visualize dữ liệu:
-ví dụ:
-python main.py "K:\downloads" "K:\output_txt" "K:\errors"
-
-📌 Tham số:
-K:\downloads → Thư mục chứa file Word
-K:\output_txt → Thư mục để lưu file TXT
-K:\errors → Thư mục chứa file lỗi
-
-📊 Output Visualization
-Sau khi chạy, chương trình sẽ hiển thị 3 biểu đồ thống kê:
-Tổng số file theo định dạng
-Số lượng file lỗi
-Danh sách file trùng lặp
-📌 Ví dụ biểu đồ:
-
-❓ Lỗi phổ biến & Cách khắc phục
-Lỗi Nguyên nhân Cách sửa
-No module named 'win32com' Chưa cài pywin32 Chạy pip install pywin32
-FileNotFoundError Đường dẫn sai Kiểm tra đường dẫn file
-PermissionError File đang mở Đóng Microsoft Word trước khi chạy
 ```
 
-**Bước cuối là chạy lại file check_fix.ipynb**
-Vì sẽ có những file doc,docs,DOC bị lỗi trong quá trình convert nên phải check lại là fix thủ công nếu cần
+## Usage
+
+```bash
+# Basic conversion
+python main.py --input file.pdf --output file.md
+
+# Batch conversion (recommend)
+python main.py --input folder/ --output output/ --format md
+```
+
+## Supported Formats
+
+- Text to PDF
+- PDF to Text
+- Image to Text (OCR)
+- And more...
+
+## Requirements
+
+- Python 3.7 or higher
+- Required dependencies listed in requirements.txt
+
+## Configuration
+
+Before running the tool, you need to set up your Google API key.
+
+1. Visit [Google API Console](https://makersuite.google.com/app/apikey) to create or obtain your API key.
+2. Create a file named `api.json` in the project root directory with the following content:
+
+```json
+{
+    "api_key": "YOUR_GOOGLE_API_KEY"
+}
+```
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
