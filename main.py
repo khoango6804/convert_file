@@ -5,36 +5,55 @@ import json
 from typing import List, Tuple
 
 from utils.doc_converter import extract_text_from_doc, extract_text_from_docx
-from utils.file_utils import ensure_folder_exists, move_to_error_folder
+from utils.file_utils import (
+    ensure_folder_exists,
+    move_to_error_folder,
+    move_to_processed_folder,
+    is_already_processed,
+)
 from utils.pdf_converter import PDFConverter
 
 
-def setup_folders() -> Tuple[str, str, str]:
+def setup_folders() -> Tuple[str, str, str, str]:  # Updated return type
     """Setup required folders and return their paths"""
     base_dir = os.path.dirname(os.path.abspath(__file__))
     folders = {
         "input": os.path.join(base_dir, "data", "input"),
         "output": os.path.join(base_dir, "data", "output"),
         "error": os.path.join(base_dir, "data", "error"),
+        "processed": os.path.join(base_dir, "data", "processed"),
     }
 
     # Create folders if they don't exist
     for folder in folders.values():
         ensure_folder_exists(folder)
 
-    return folders["input"], folders["output"], folders["error"]
+    return folders["input"], folders["output"], folders["error"], folders["processed"]
 
 
-def check_input_files(input_folder: str, error_folder: str) -> Tuple[List[str], bool]:
+def check_input_files(
+    input_folder: str, error_folder: str, output_folder: str, processed_folder: str
+) -> Tuple[List[str], bool]:
     """Check input and error folders for valid files"""
     input_files = []
     error_files = []
+    already_processed = []
 
     # Check input folder
     for root, _, files in os.walk(input_folder):
         for file in files:
             if file.lower().endswith((".doc", ".docx", ".pdf")):
-                input_files.append(os.path.join(root, file))
+                file_path = os.path.join(root, file)
+
+                # Check if file has already been processed
+                if is_already_processed(file_path, output_folder):
+                    # Move directly to processed folder
+                    print(f"⏭️ Đã tìm thấy file đã xử lý: {file}")
+                    move_to_processed_folder(file_path, processed_folder)
+                    already_processed.append(file)
+                else:
+                    # New file, add to processing queue
+                    input_files.append(file_path)
 
     # Check error folder
     for root, _, files in os.walk(error_folder):
@@ -43,6 +62,12 @@ def check_input_files(input_folder: str, error_folder: str) -> Tuple[List[str], 
                 (".doc", ".docx", ".pdf")
             ):
                 error_files.append(os.path.join(root, file))
+
+    # Print summary of skipped files
+    if already_processed:
+        print(
+            f"⏭️ Đã chuyển {len(already_processed)} file đã xử lý trước đó sang thư mục processed"
+        )
 
     # If input is empty but error has files, process error folder
     if not input_files and error_files:
@@ -62,7 +87,7 @@ def check_input_files(input_folder: str, error_folder: str) -> Tuple[List[str], 
 
 
 def process_files(
-    files: List[str], output_folder: str, error_folder: str
+    files: List[str], output_folder: str, error_folder: str, processed_folder: str
 ) -> Tuple[dict, List[str], List[str]]:
     """
     Process files and handle errors
@@ -146,8 +171,12 @@ def process_files(
                 print(f"✅ Đã xử lý: {file}")
                 processed_files.append(file)
 
-                # No longer deleting original files
-                # Only note successful processing
+                # Add this: Move processed files to a processed folder
+                processed_folder = os.path.join(
+                    os.path.dirname(output_folder), "processed"
+                )
+                move_to_processed_folder(input_path, processed_folder)
+
                 if os.path.dirname(input_path) == error_folder:
                     print(f"✅ Đã xử lý file từ thư mục error: {file}")
 
@@ -234,12 +263,15 @@ def main():
 
         # 1. Setup folders
         print("\n📂 Đang tạo thư mục...")
-        input_folder, output_folder, error_folder = setup_folders()
+        input_folder, output_folder, error_folder, processed_folder = setup_folders()
         print("✅ Đã tạo xong các thư mục cần thiết")
 
         # 2. Check input files
         print("\n🔍 Đang kiểm tra file...")
-        valid_files, is_error_processing = check_input_files(input_folder, error_folder)
+        # Fix this line to pass all required arguments
+        valid_files, is_error_processing = check_input_files(
+            input_folder, error_folder, output_folder, processed_folder
+        )
         if not valid_files:
             print("❌ Không tìm thấy file nào để xử lý")
             print(f"ℹ️ Vui lòng thêm file vào thư mục: {input_folder}")
@@ -251,9 +283,12 @@ def main():
         print(f"\n🔄 Bắt đầu xử lý {total_files} files từ {source_folder}...")
 
         # Get file statistics from process_files
+        # You can either modify process_files to accept processed_folder or keep using the
+        # hardcoded path in the process_files function
         file_types, processed_files, error_files = process_files(
-            valid_files, output_folder, error_folder
+            valid_files, output_folder, error_folder, processed_folder
         )
+
         print("\n✅ Hoàn tất xử lý files")
 
         # 4. Generate report
