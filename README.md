@@ -19,17 +19,17 @@ git clone https://github.com/username/convert_file.git
 cd convert_file
 
 # Install dependencies
-npm install
+pip install -r requirements.txt
 ```
 
 ## Usage
 
 ```bash
 # Basic conversion
-node convert.js --input file.txt --output file.pdf
+python main.py --input file.pdf --output file.md
 
-# Batch conversion
-node convert.js --input folder/ --output output/ --format pdf
+# Batch conversion (recommend)
+python main.py --input folder/ --output output/ --format md
 ```
 
 ## Supported Formats
@@ -41,8 +41,21 @@ node convert.js --input folder/ --output output/ --format pdf
 
 ## Requirements
 
-- Node.js v14 or higher
-- Required dependencies listed in package.json
+- Python 3.7 or higher
+- Required dependencies listed in requirements.txt
+
+## Configuration
+
+Before running the tool, you need to set up your Google API key.
+
+1. Visit [Google API Console](https://makersuite.google.com/app/apikey) to create or obtain your API key.
+2. Create a file named `api.json` in the project root directory with the following content:
+
+```json
+{
+    "api_key": "YOUR_GOOGLE_API_KEY"
+}
+```
 
 ## Contributing
 
