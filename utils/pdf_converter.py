@@ -10,6 +10,9 @@ import time
 from tenacity import retry, stop_after_attempt, wait_exponential
 from datetime import datetime, timedelta
 
+import logging
+from tqdm import tqdm
+
 
 def estimate_tokens(self, text=None, image=None):
     """Estimate token usage of a request"""
@@ -55,12 +58,12 @@ class PDFConverter:
                 self.client = genai.Client(
                     api_key=self.api_keys[self.current_key_index]
                 )
-                print(
+                logging.info(
                     f"✅ Đã kết nối Gemini API (Key {self.current_key_index + 1}/{len(self.api_keys)})"
                 )
 
         except Exception as e:
-            print(f"❌ Lỗi cấu hình Gemini API: {e}")
+            logging.error(f"❌ Lỗi cấu hình Gemini API: {e}")
             raise
 
         self.temp_dir = tempfile.mkdtemp()
@@ -75,28 +78,58 @@ class PDFConverter:
         self._rotation_cycle_count = 0
         self._last_rotation_time = time.time()
 
-    def _save_progress(self, progress_file, processed_pages, tokens_used):
-        """Save processing progress to allow resuming later"""
-        try:
-            progress_data = {
-                "timestamp": datetime.now().isoformat(),
-                "pages": processed_pages,
-                "tokens_used": tokens_used,
-            }
+    def _save_progress_with_retries(
+        self, progress_file, processed_pages, tokens_used, page_retries=None
+    ):
+        """Save processing progress with retry mechanism"""
+        max_retries = 3
+        retry_count = 0
 
-            with open(progress_file, "w", encoding="utf-8") as f:
-                json.dump(progress_data, f, ensure_ascii=False, indent=2)
+        while retry_count < max_retries:
+            try:
+                progress_data = {
+                    "timestamp": datetime.now().isoformat(),
+                    "pages": processed_pages,
+                    "tokens_used": tokens_used,
+                    "page_retries": page_retries or {},
+                    "last_api_key": self.current_key_index,
+                    "last_update": time.time(),
+                }
 
-            print(f"💾 Đã lưu tiến độ ({len(processed_pages)} trang)")
-        except Exception as e:
-            print(f"⚠️ Không thể lưu tiến độ: {str(e)}")
+                # Tạo thư mục cha nếu chưa tồn tại
+                os.makedirs(os.path.dirname(progress_file), exist_ok=True)
+
+                # Ghi file tạm trước
+                temp_file = progress_file + ".tmp"
+                with open(temp_file, "w", encoding="utf-8") as f:
+                    json.dump(progress_data, f, ensure_ascii=False, indent=2)
+
+                # Rename file tạm thành file chính (atomic operation)
+                if os.path.exists(progress_file):
+                    os.replace(temp_file, progress_file)
+                else:
+                    os.rename(temp_file, progress_file)
+
+                # Không hiển thị thông báo quá nhiều lần để tránh spam
+                if len(processed_pages) % 5 == 0 or len(processed_pages) == 1:
+                    logging.info(f"💾 Đã lưu tiến độ ({len(processed_pages)} trang)")
+                return True
+
+            except Exception as e:
+                retry_count += 1
+                if retry_count >= max_retries:
+                    logging.error(
+                        f"⚠️ Không thể lưu tiến độ sau {max_retries} lần thử: {str(e)}"
+                    )
+                    return False
+                time.sleep(1)  # Đợi 1 giây trước khi thử lại
 
     def _prepare_image_for_api(self, image):
         """Prepare image for API with quota optimization"""
         try:
             # Ensure we have a valid image
             if not isinstance(image, Image.Image):
-                print("⚠️ Invalid image provided")
+                logging.warning("⚠️ Invalid image provided")
                 return None
 
             # Resize image more aggressively for token savings
@@ -110,14 +143,14 @@ class PDFConverter:
                     new_height = max_dimension
                     new_width = int(width * (max_dimension / height))
                 image = image.resize((new_width, new_height), Image.LANCZOS)
-                print(
+                logging.info(
                     f"🔍 Đã resize hình ảnh từ {width}x{height} thành {new_width}x{new_height}"
                 )
 
             # Convert to grayscale to reduce tokens
             if image.mode != "L":
                 image = ImageOps.grayscale(image)
-                print("🔍 Đã chuyển ảnh sang grayscale để giảm token")
+                logging.info("🔍 Đã chuyển ảnh sang grayscale để giảm token")
 
             # Compress image quality
             img_bytes = io.BytesIO()
@@ -129,7 +162,7 @@ class PDFConverter:
             return img_bytes.getvalue()
 
         except Exception as e:
-            print(f"⚠️ Error preparing image: {str(e)}")
+            logging.error(f"⚠️ Error preparing image: {str(e)}")
             return None
 
     @retry(
@@ -143,7 +176,7 @@ class PDFConverter:
                 hasattr(self, "rotation_count")
                 and self.rotation_count >= len(self.api_keys) * 2
             ):
-                print("⚠️ Đang quay vòng API key quá nhanh. Tạm dừng...")
+                logging.error("⚠️ Đang quay vòng API key quá nhanh. Tạm dừng...")
                 time.sleep(30)  # Take a longer break
                 self.rotation_count = 0
 
@@ -184,7 +217,9 @@ class PDFConverter:
                         return self._call_gemini_api(prompt, image)
                     else:
                         # Single key case - save progress before waiting
-                        print("⚠️ Hết hạn API, đã lưu tiến độ. Có thể tiếp tục sau.")
+                        logging.error(
+                            "⚠️ Hết hạn API, đã lưu tiến độ. Có thể tiếp tục sau."
+                        )
                         # Let the error propagate so the main function can save progress
                         raise Exception("API_QUOTA_EXHAUSTED")
 
@@ -192,11 +227,13 @@ class PDFConverter:
                 raise
 
         except Exception as e:
-            print(f"❌ API error: {str(e)}")
+            logging.error(f"❌ API error: {str(e)}")
 
             # If we've retried too many times, take a break
             if self.retry_count >= self.max_retries:
-                print(f"⚠️ Maximum retries reached. Waiting {self.wait_time} seconds...")
+                logging.error(
+                    f"⚠️ Maximum retries reached. Waiting {self.wait_time} seconds..."
+                )
                 time.sleep(self.wait_time)
                 self.retry_count = 0
             else:
@@ -224,7 +261,7 @@ class PDFConverter:
 
         # Update the tracker
         self.quota_tracker["keys"] = new_keys
-        print(f"✅ Đã điều chỉnh quota tracker cho {len(new_keys)} API keys")
+        logging.info(f"✅ Đã điều chỉnh quota tracker cho {len(new_keys)} API keys")
 
     def save_quota_tracker(self):
         """Save quota tracker to file"""
@@ -241,7 +278,7 @@ class PDFConverter:
             # Set next allowed time to 24 hours from now
             next_time = datetime.now() + timedelta(hours=24)
             key_data["next_allowed_time"] = next_time.isoformat()
-            print(
+            logging.warning(
                 f"⚠️ Daily limit reached for key {self.current_key_index + 1}. Next allowed: {next_time}"
             )
 
@@ -268,17 +305,17 @@ class PDFConverter:
                 for _ in range(len(self.api_keys) - 1):
                     self.rotate_api_key()
                     if self.check_key_availability():
-                        print(
+                        logging.info(
                             f"🔄 Đã chuyển sang API key {self.current_key_index + 1} vì key {original_key + 1} đang bị giới hạn"
                         )
                         return True
 
                 # If we're here, all keys are exhausted
-                print(wait_message)
+                logging.error(wait_message)
                 return False
             else:
                 # We only have one key and it's exhausted
-                print(wait_message)
+                logging.error(wait_message)
                 return False
 
         return True  # Key is available
@@ -301,7 +338,7 @@ class PDFConverter:
             # Only log if we're not cycling too rapidly
             current_time = time.time()
             if current_time - self._last_rotation_time > 5:
-                print(
+                logging.info(
                     f"🔄 Đã chuyển sang API key {self.current_key_index + 1}/{len(self.api_keys)}"
                 )
 
@@ -317,13 +354,15 @@ class PDFConverter:
                 self.rotation_count >= len(self.api_keys) * 2
                 and current_time - self._last_rotation_time < 30
             ):
-                print("⚠️ Đã thử tất cả API keys nhiều lần. Tạm dừng 30 giây...")
+                logging.warning(
+                    "⚠️ Đã thử tất cả API keys nhiều lần. Tạm dừng 30 giây..."
+                )
                 time.sleep(30)
                 self.rotation_count = 0  # Reset counter
 
             return True
         except Exception as e:
-            print(f"❌ Lỗi khi chuyển API key: {str(e)}")
+            logging.error(f"❌ Lỗi khi chuyển API key: {str(e)}")
             self.current_key_index = previous_key  # Revert to previous key
             return False
 
@@ -358,11 +397,11 @@ class PDFConverter:
             else:
                 img_cropped = img_denoised
 
-            print("✨ Đã xử lý ảnh để tăng chất lượng OCR")
+            logging.info("✨ Đã xử lý ảnh để tăng chất lượng OCR")
             return img_cropped
 
         except Exception as e:
-            print(f"⚠️ Lỗi xử lý ảnh: {e}")
+            logging.warning(f"⚠️ Lỗi xử lý ảnh: {e}")
             return image
 
     def check_vietnamese_text(self, text: str) -> str:
@@ -405,7 +444,7 @@ class PDFConverter:
             return response.text if response.text else text
 
         except Exception as e:
-            print(f"⚠️ Lỗi kiểm tra chính tả: {e}")
+            logging.warning(f"⚠️ Lỗi kiểm tra chính tả: {e}")
             return text
 
     def clean_markdown_content(self, text: str) -> str:
@@ -458,7 +497,7 @@ class PDFConverter:
             return cleaned_text
 
         except Exception as e:
-            print(f"⚠️ Lỗi khi làm sạch Markdown: {e}")
+            logging.warning(f"⚠️ Lỗi khi làm sạch Markdown: {e}")
             return text
 
     def estimate_tokens(self, text=None, image=None):
@@ -487,6 +526,7 @@ class PDFConverter:
         """
         estimated_tokens_used = 0
         pdf_document = None
+        start_time = time.time()
 
         # Define progress file path based on PDF name
         pdf_filename = os.path.splitext(os.path.basename(pdf_path))[0]
@@ -498,6 +538,7 @@ class PDFConverter:
 
         # Initialize or load progress data
         processed_pages = {}
+        current_page_retries = {}
         start_page = 0
 
         if resume and os.path.exists(progress_file):
@@ -506,169 +547,245 @@ class PDFConverter:
                     progress_data = json.load(f)
                     processed_pages = progress_data.get("pages", {})
                     estimated_tokens_used = progress_data.get("tokens_used", 0)
-                    print(
+                    current_page_retries = progress_data.get("page_retries", {})
+                    logging.info(
                         f"🔄 Tiếp tục xử lý từ tiến độ đã lưu. Đã xử lý {len(processed_pages)} trang."
                     )
             except Exception as e:
-                print(f"⚠️ Không thể tải tiến độ đã lưu: {str(e)}")
+                logging.warning(f"⚠️ Không thể tải tiến độ đã lưu: {str(e)}")
 
         try:
             # Open PDF
             pdf_document = fitz.open(pdf_path)
 
             if pdf_document.page_count == 0:
-                print(f"⚠️ PDF không có trang nào: {os.path.basename(pdf_path)}")
+                logging.warning(
+                    f"⚠️ PDF không có trang nào: {os.path.basename(pdf_path)}"
+                )
                 return False
 
             all_text = []
-            print(f"🔍 Đang chuyển đổi {pdf_path}...")
+            logging.info(f"🔍 Đang chuyển đổi {pdf_path}...")
 
             # Tracking variables
-            success_count = 0
+            success_count = len(processed_pages)
             failed_count = 0
             total_pages = pdf_document.page_count
 
-            for page_num in range(total_pages):
-                # Skip already processed pages if resuming
-                page_key = str(page_num)
-                if resume and page_key in processed_pages:
-                    all_text.append(processed_pages[page_key])
-                    print(f"⏩ Bỏ qua trang {page_num + 1} (đã xử lý trước đó)")
-                    continue
+            # Hiển thị thông tin PDF
+            logging.info(
+                f"📄 File PDF có {total_pages} trang, đã xử lý {success_count} trang"
+            )
 
-                retry_count = 0
-                max_page_retries = 2
-                page_processed = False
+            # Khởi tạo thanh tiến độ với tqdm
+            pbar = tqdm(
+                total=total_pages,
+                initial=success_count,
+                desc="Xử lý trang PDF",
+                unit="trang",
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+            )
+            try:
+                for page_num in range(total_pages):
+                    # Skip already processed pages if resuming
+                    page_key = str(page_num)
+                    if resume and page_key in processed_pages:
+                        all_text.append(processed_pages[page_key])
+                        continue
 
-                while retry_count <= max_page_retries and not page_processed:
-                    try:
-                        # Get the page with error handling
+                    retry_count = current_page_retries.get(page_key, 0)
+                    max_page_retries = 2
+                    page_processed = False
+
+                    while retry_count <= max_page_retries and not page_processed:
                         try:
-                            page = pdf_document[page_num]
-                        except IndexError:
-                            print(f"⚠️ Lỗi khi truy cập trang {page_num + 1}")
-                            failed_count += 1
-                            break
+                            # Get the page with error handling
+                            try:
+                                page = pdf_document[page_num]
+                            except IndexError:
+                                logging.warning(
+                                    f"⚠️ Lỗi khi truy cập trang {page_num + 1}"
+                                )
+                                failed_count += 1
+                                break
 
-                        if not page:
-                            print(f"⚠️ Không thể đọc trang {page_num + 1}")
-                            failed_count += 1
-                            break
+                            if not page:
+                                logging.warning(f"⚠️ Không thể đọc trang {page_num + 1}")
+                                failed_count += 1
+                                break
 
-                        # Convert page to image
-                        try:
-                            pix = page.get_pixmap(
-                                matrix=fitz.Matrix(200 / 72, 200 / 72)
-                            )
-                            img = Image.frombytes(
-                                "RGB", [pix.width, pix.height], pix.samples
-                            )
-                        except Exception as img_err:
-                            print(
-                                f"⚠️ Lỗi khi tạo ảnh trang {page_num + 1}: {str(img_err)}"
-                            )
-                            retry_count += 1
-                            continue
-
-                        # Preprocess image
-                        img_processed = self.preprocess_image(img)
-
-                        # Create prompt for Gemini
-                        prompt = """
-                        Chuyển thành Markdown:
-
-                        1. Tiêu đề:
-                        - # tiêu đề chính
-                        - ## tiêu đề cấp 2
-                        - ### phần chính
-
-                        2. Định dạng:
-                        - **CỘNG HÒA XÃ HỘI CHỦ NGHĨA VIỆT NAM**
-                        - *Thời gian, địa điểm*
-                        - > trích dẫn
-                        - --- đường kẻ
-
-                        3. Bảng/Danh sách:
-                        - | và - cho bảng (số căn phải)
-                        - - cho danh sách không thứ tự
-                        - 1. cho danh sách thứ tự
-
-                        Giữ nguyên: mã văn bản, số liệu, dấu câu, định dạng tiếng Việt.
-                        """
-                        prompt_tokens = self.estimate_tokens(prompt)
-                        image_tokens = self.estimate_tokens(image=img_processed)
-                        request_tokens = prompt_tokens + image_tokens
-
-                        # Check if we're over budget
-                        if token_budget and (
-                            estimated_tokens_used + request_tokens > token_budget
-                        ):
-                            print(
-                                f"⚠️ Token budget ({token_budget}) would be exceeded. Stopping."
-                            )
-                            break
-
-                        # After successful API call:
-                        estimated_tokens_used += request_tokens
-                        print(
-                            f"📊 Estimated tokens used so far: {estimated_tokens_used}"
-                        )
-                        # Try to call API with error handling
-                        try:
-                            response = self._call_gemini_api(prompt, img_processed)
-
-                            if response and hasattr(response, "text") and response.text:
-                                all_text.append(response.text)
-                                success_count += 1
-                                page_processed = True
-                                print(f"✅ Đã xử lý trang {page_num + 1}/{total_pages}")
-                            else:
-                                print(
-                                    f"⚠️ Không có phản hồi từ API cho trang {page_num + 1}"
+                            # Convert page to image
+                            try:
+                                pix = page.get_pixmap(
+                                    matrix=fitz.Matrix(200 / 72, 200 / 72)
+                                )
+                                img = Image.frombytes(
+                                    "RGB", [pix.width, pix.height], pix.samples
+                                )
+                            except Exception as img_err:
+                                logging.warning(
+                                    f"⚠️ Lỗi khi tạo ảnh trang {page_num + 1}: {str(img_err)}"
                                 )
                                 retry_count += 1
-                        except Exception as api_err:
-                            print(f"❌ Lỗi API trang {page_num + 1}: {str(api_err)}")
+                                continue
+
+                            # Preprocess image
+                            img_processed = self.preprocess_image(img)
+
+                            # Sử dụng prompt ngắn hơn để tiết kiệm token
+                            prompt = """
+                            Chuyển thành Markdown:
+                            - # tiêu đề chính, ## tiêu đề cấp 2, ### phần chính
+                            - **CỘNG HÒA XÃ HỘI CHỦ NGHĨA VIỆT NAM**
+                            - *Thời gian, địa điểm*
+                            - > trích dẫn, --- đường kẻ
+                            - | và - cho bảng (số căn phải)
+                            - - danh sách không thứ tự, 1. danh sách thứ tự
+                            Giữ nguyên mã văn bản, số liệu, dấu câu, định dạng tiếng Việt.
+                            """
+
+                            prompt_tokens = self.estimate_tokens(prompt)
+                            image_tokens = self.estimate_tokens(image=img_processed)
+                            request_tokens = prompt_tokens + image_tokens
+
+                            # Check if we're over budget
+                            if token_budget and (
+                                estimated_tokens_used + request_tokens > token_budget
+                            ):
+                                logging.warning(
+                                    f"⚠️ Đã vượt ngân sách token ({token_budget}). Dừng xử lý."
+                                )
+                                break
+
+                            # Try to call API with error handling
+                            try:
+                                response = self._call_gemini_api(prompt, img_processed)
+
+                                # Cập nhật số tokens đã sử dụng
+                                estimated_tokens_used += request_tokens
+
+                                if (
+                                    response
+                                    and hasattr(response, "text")
+                                    and response.text
+                                ):
+                                    all_text.append(response.text)
+                                    processed_pages[page_key] = response.text
+                                    success_count += 1
+                                    page_processed = True
+
+                                    # Cập nhật thanh tiến độ
+                                    pbar.update(1)
+                                    # Thêm thông tin token vào thanh tiến độ
+                                    pbar.set_postfix(tokens=estimated_tokens_used)
+
+                                    # Lưu tiến độ sau mỗi trang thành công
+                                    self._save_progress_with_retries(
+                                        progress_file,
+                                        processed_pages,
+                                        estimated_tokens_used,
+                                        current_page_retries,
+                                    )
+                                else:
+                                    logging.warning(
+                                        f"⚠️ Không có phản hồi từ API cho trang {page_num + 1}"
+                                    )
+                                    retry_count += 1
+                                    current_page_retries[page_key] = retry_count
+                            except Exception as api_err:
+                                error_msg = str(api_err)
+                                if "API_QUOTA_EXHAUSTED" in error_msg:
+                                    logging.warning(
+                                        f"⚠️ Tất cả API key đã hết quota khi xử lý trang {page_num + 1}"
+                                    )
+                                    # Lưu tiến độ để tiếp tục sau
+                                    self._save_progress_with_retries(
+                                        progress_file,
+                                        processed_pages,
+                                        estimated_tokens_used,
+                                        current_page_retries,
+                                    )
+                                    pbar.close()
+                                    logging.info(
+                                        "💾 Đã lưu tiến độ. Có thể tiếp tục xử lý sau với 'resume=True'"
+                                    )
+                                    return False
+                                else:
+                                    logging.error(
+                                        f"❌ Lỗi API trang {page_num + 1}: {str(api_err)}"
+                                    )
+                                    retry_count += 1
+                                    current_page_retries[page_key] = retry_count
+                                    if retry_count <= max_page_retries:
+                                        self.rotate_api_key()
+                                        time.sleep(2)  # Tạm dừng ngắn trước khi thử lại
+
+                        except Exception as page_err:
+                            logging.warning(
+                                f"⚠️ Lỗi xử lý trang {page_num + 1}: {str(page_err)}"
+                            )
                             retry_count += 1
-                            # If we still have retries left, try with a different API key
-                            if retry_count <= max_page_retries:
-                                self.rotate_api_key()
-                                time.sleep(2)  # Short pause before retrying
+                            current_page_retries[page_key] = retry_count
 
-                    except Exception as page_err:
-                        print(f"⚠️ Lỗi xử lý trang {page_num + 1}: {str(page_err)}")
-                        retry_count += 1
+                    # Count as failed if all retries were used up without success
+                    if not page_processed:
+                        failed_count += 1
 
-                # Count as failed if all retries were used up without success
-                if not page_processed:
-                    failed_count += 1
-                else:
-                    processed_pages[page_key] = response.text
-                    # Save progress after each successful page
-                    self._save_progress(
-                        progress_file, processed_pages, estimated_tokens_used
-                    )
+            except KeyboardInterrupt:
+                # Đóng thanh tiến độ nếu đang hiển thị
+                if "pbar" in locals():
+                    pbar.close()
+
+                # Lưu tiến độ trước khi thoát
+                logging.warning(
+                    "⚠️ Phát hiện lệnh dừng từ người dùng (Ctrl+C). Đang lưu tiến độ..."
+                )
+                self._save_progress_with_retries(
+                    progress_file,
+                    processed_pages,
+                    estimated_tokens_used,
+                    current_page_retries,
+                )
+                logging.info(
+                    f"💾 Đã lưu tiến độ ({len(processed_pages)}/{total_pages} trang). Có thể tiếp tục với resume=True"
+                )
+
+                # Đóng PDF document trước khi thoát
+                if pdf_document:
+                    try:
+                        pdf_document.close()
+                    except Exception:
+                        pass
+
+                return False  # Return False to indicate incomplete processing
+
+            # Đóng thanh tiến độ khi hoàn tất
+            pbar.close()
 
             # Check if we processed any pages successfully
             if not all_text:
-                print(
+                logging.error(
                     f"❌ Không thể xử lý bất kỳ trang nào của PDF ({failed_count}/{total_pages} lỗi)"
                 )
                 return False
 
-            print(
-                f"📊 Kết quả xử lý: {success_count}/{total_pages} trang thành công ({success_count / total_pages * 100:.1f}%)"
+            total_time = time.time() - start_time
+            minutes = int(total_time // 60)
+            seconds = int(total_time % 60)
+            logging.info(
+                f"📊 Kết quả xử lý: {success_count}/{total_pages} trang thành công "
+                f"({success_count / total_pages * 100:.1f}%) trong {minutes}m {seconds}s"
             )
 
             # Join all text and process
             try:
-                print("🔍 Đang kiểm tra và định dạng Markdown...")
+                logging.info("🔍 Đang kiểm tra và định dạng Markdown...")
                 combined_text = "\n\n".join(all_text)
 
                 try:
                     corrected_text = self.check_vietnamese_text(combined_text)
                 except Exception as vn_err:
-                    print(f"⚠️ Lỗi kiểm tra tiếng Việt: {str(vn_err)}")
+                    logging.warning(f"⚠️ Lỗi kiểm tra tiếng Việt: {str(vn_err)}")
                     corrected_text = combined_text
 
                 # Create output filename
@@ -679,18 +796,18 @@ class PDFConverter:
                 try:
                     cleaned_text = self.clean_markdown_content(corrected_text)
                 except Exception as clean_err:
-                    print(f"⚠️ Lỗi làm sạch Markdown: {str(clean_err)}")
+                    logging.warning(f"⚠️ Lỗi làm sạch Markdown: {str(clean_err)}")
                     cleaned_text = corrected_text
 
                 # Save the final text
                 with open(output_path, "w", encoding="utf-8") as f:
                     f.write(cleaned_text)
 
-                print(f"✅ Đã lưu văn bản: {output_path}")
+                logging.info(f"✅ Đã lưu văn bản: {output_path}")
                 return output_path
 
             except Exception as process_err:
-                print(f"❌ Lỗi xử lý văn bản cuối cùng: {str(process_err)}")
+                logging.error(f"❌ Lỗi xử lý văn bản cuối cùng: {str(process_err)}")
 
                 # Try to save raw text if final processing fails
                 try:
@@ -703,16 +820,25 @@ class PDFConverter:
                     with open(emergency_path, "w", encoding="utf-8") as f:
                         f.write(emergency_text)
 
-                    print(f"⚠️ Đã lưu văn bản khẩn cấp: {emergency_path}")
+                    logging.error(f"⚠️ Đã lưu văn bản khẩn cấp: {emergency_path}")
                     return emergency_path
                 except Exception as emergency_err:
-                    print(f"❌ Không thể lưu văn bản khẩn cấp: {str(emergency_err)}")
+                    logging.error(
+                        f"❌ Không thể lưu văn bản khẩn cấp: {str(emergency_err)}"
+                    )
                     return False
 
         except Exception as e:
-            print(f"❌ Lỗi chuyển đổi PDF: {str(e)}")
+            logging.error(f"❌ Lỗi chuyển đổi PDF: {str(e)}")
             # Save progress on exception too
-            self._save_progress(progress_file, processed_pages, estimated_tokens_used)
+            self._save_progress_with_retries(
+                progress_file,
+                processed_pages,
+                estimated_tokens_used,
+                current_page_retries,
+            )
+            if "pbar" in locals():
+                pbar.close()
             return False
 
         finally:
@@ -721,7 +847,7 @@ class PDFConverter:
                 try:
                     pdf_document.close()
                 except Exception as close_err:
-                    print(f"⚠️ Lỗi khi đóng file PDF: {str(close_err)}")
+                    logging.warning(f"⚠️ Lỗi khi đóng file PDF: {str(close_err)}")
 
     def cleanup(self):
         """Clean up temporary resources after processing"""
@@ -732,9 +858,9 @@ class PDFConverter:
                     import shutil
 
                     shutil.rmtree(self.temp_dir)
-                    print(f"✅ Đã dọn dẹp thư mục tạm: {self.temp_dir}")
+                    logging.info(f"✅ Đã dọn dẹp thư mục tạm: {self.temp_dir}")
                 except Exception as e:
-                    print(f"⚠️ Không thể dọn dẹp thư mục tạm: {str(e)}")
+                    logging.warning(f"⚠️ Không thể dọn dẹp thư mục tạm: {str(e)}")
 
             # Reset API rotation counters to prevent issues on next run
             if hasattr(self, "_rotation_cycle_count"):
@@ -756,7 +882,7 @@ class PDFConverter:
                 ):
                     self.save_quota_tracker()
             except Exception as quota_err:
-                print(f"⚠️ Lỗi lưu trữ quota tracker: {str(quota_err)}")
+                logging.warning(f"⚠️ Lỗi lưu trữ quota tracker: {str(quota_err)}")
 
             # Clean up progress files for completed documents
             progress_dir = os.path.join(
@@ -774,10 +900,10 @@ class PDFConverter:
                             )
                             if file_time < cutoff:
                                 os.remove(filepath)
-                                print(f"🧹 Đã xóa tiến độ cũ: {filename}")
+                                logging.warning(f"🧹 Đã xóa tiến độ cũ: {filename}")
                 except Exception as e:
-                    print(f"⚠️ Không thể dọn dẹp file tiến độ: {str(e)}")
+                    logging.warning(f"⚠️ Không thể dọn dẹp file tiến độ: {str(e)}")
 
-            print("✅ Đã dọn dẹp tài nguyên tạm thời")
+            logging.info("✅ Đã dọn dẹp tài nguyên tạm thời")
         except Exception as e:
-            print(f"⚠️ Lỗi khi dọn dẹp: {str(e)}")
+            logging.warning(f"⚠️ Lỗi khi dọn dẹp: {str(e)}")
