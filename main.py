@@ -6,6 +6,7 @@ from typing import List, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from utils.log_config import setup_logging
+import multiprocessing
 
 from utils.doc_converter import extract_text_from_doc, extract_text_from_docx
 from utils.file_utils import (
@@ -33,6 +34,51 @@ def setup_folders() -> Tuple[str, str, str, str]:  # Updated return type
         ensure_folder_exists(folder)
 
     return folders["input"], folders["output"], folders["error"], folders["processed"]
+
+
+def get_optimal_worker_count():
+    """
+    Xác định số lượng worker tối ưu dựa trên CPU và yêu cầu hệ thống.
+    Đảm bảo không sử dụng hết tài nguyên hệ thống và giữ lại ít nhất 1 core
+    cho các tác vụ khác.
+    """
+    # Lấy số CPU cores
+    cpu_count = multiprocessing.cpu_count()
+
+    # Kiểm tra RAM khả dụng (nếu trên Windows)
+    ram_gb = None
+    try:
+        if os.name == "nt":  # Windows
+            import psutil
+
+            ram_gb = psutil.virtual_memory().total / (1024**3)
+    except ImportError:
+        pass  # psutil không khả dụng, bỏ qua kiểm tra RAM
+
+    # Phân bổ workers
+    if cpu_count <= 2:
+        # Hệ thống nhỏ: sử dụng 1 worker
+        workers = 1
+    elif cpu_count <= 4:
+        # Hệ thống trung bình: Giữ lại 1 core
+        workers = cpu_count - 1
+    else:
+        # Hệ thống lớn: Sử dụng 75% số core
+        workers = max(1, int(cpu_count * 0.75))
+
+    # Điều chỉnh dựa trên RAM (nếu có thông tin)
+    if ram_gb is not None:
+        # Xử lý PDF tốn RAM, giảm workers nếu ít RAM
+        if ram_gb < 4:  # Dưới 4GB
+            workers = min(workers, 2)
+        elif ram_gb < 8:  # Dưới 8GB
+            workers = min(workers, 4)
+        # Ngược lại giữ nguyên workers đã tính
+
+    # Giới hạn tối đa workers là 8 để tránh cạnh tranh tài nguyên quá mức
+    workers = min(workers, 8)
+
+    return workers
 
 
 def check_input_files(
@@ -96,7 +142,6 @@ def process_file(
     """Process a single file and handle errors"""
     file = os.path.basename(input_path)
     file_lower = file.lower()
-    processed_file_paths = set()
     file_types = {"pdf": 0, "doc": 0, "docx": 0}
     processed_files = []
     error_files = []
@@ -169,6 +214,58 @@ def process_file(
     return file_types, processed_files, error_files
 
 
+def sort_files_by_complexity(files: List[str]) -> List[str]:
+    """
+    Sắp xếp danh sách file để ưu tiên xử lý các file nhẹ và ít trang trước
+    """
+    file_info = []
+
+    for file_path in files:
+        try:
+            # Lấy kích thước file
+            file_size = os.path.getsize(file_path)
+            page_count = 1  # Mặc định
+
+            # Đối với PDF, đếm số trang thực tế
+            if file_path.lower().endswith(".pdf"):
+                try:
+                    import fitz
+
+                    doc = fitz.open(file_path)
+                    page_count = doc.page_count
+                    doc.close()
+                except Exception:
+                    # Nếu không đếm được số trang, giữ nguyên giá trị mặc định
+                    pass
+
+            # Tính điểm phức tạp = kích thước * số trang
+            complexity_score = file_size * page_count
+            file_info.append((file_path, complexity_score, file_size, page_count))
+
+        except Exception as e:
+            # Nếu không thể phân tích file, cho điểm phức tạp cao
+            logging.warning(
+                f"⚠️ Không thể phân tích file {os.path.basename(file_path)}: {str(e)}"
+            )
+            file_info.append((file_path, float("inf"), 0, 0))
+
+    # Sắp xếp theo điểm phức tạp tăng dần (nhẹ nhất lên đầu)
+    file_info.sort(key=lambda x: x[1])
+
+    # Log thông tin sắp xếp
+    logging.info("📋 Thứ tự xử lý file (ưu tiên file nhẹ trước):")
+    for i, (file_path, score, size, pages) in enumerate(file_info[:5], 1):
+        size_mb = size / (1024 * 1024)
+        filename = os.path.basename(file_path)
+        logging.info(f"  {i}. {filename} ({size_mb:.2f} MB, {pages} trang)")
+
+    if len(file_info) > 5:
+        logging.info(f"  ... và {len(file_info) - 5} file khác")
+
+    # Trả về danh sách các file đã sắp xếp
+    return [info[0] for info in file_info]
+
+
 def process_files(
     files: List[str], output_folder: str, error_folder: str, processed_folder: str
 ) -> Tuple[dict, List[str], List[str]]:
@@ -190,19 +287,29 @@ def process_files(
     with open(log_file, "w", encoding="utf-8") as log:
         log.write(f"# Error Log - {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
 
+    # Sắp xếp file để ưu tiên xử lý file nhẹ trước
+    logging.info("🔍 Phân tích và sắp xếp các file theo mức độ phức tạp...")
+    sorted_files = sort_files_by_complexity(files)
+
     # Khởi tạo batch info file để theo dõi tiến trình
     batch_info_file = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "data", "batch_info.json"
     )
 
+    # Xác định số lượng worker tối ưu
+    worker_count = get_optimal_worker_count()
+    logging.info(f"🖥️ Sử dụng {worker_count} worker threads dựa trên cấu hình hệ thống")
+
     # Lưu thông tin batch khi bắt đầu
+    start_time = time.time()
     try:
         with open(batch_info_file, "w") as f:
             json.dump(
                 {
-                    "total_files": len(files),
+                    "total_files": len(sorted_files),
                     "current_index": 0,
-                    "start_time": time.time(),
+                    "start_time": start_time,
+                    "worker_count": worker_count,
                 },
                 f,
             )
@@ -210,13 +317,13 @@ def process_files(
         logging.error(f"⚠️ Không thể lưu thông tin batch: {str(e)}")
 
     try:
-        total_files = len(files)
+        total_files = len(sorted_files)
         logging.info(f"Bắt đầu xử lý {total_files} files...")
 
         # Sử dụng tqdm để hiển thị tiến độ với ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=4) as executor:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
             try:
-                # Tạo tất cả các future objects trước
+                # Tạo tất cả các future objects trước - sử dụng danh sách đã sắp xếp
                 futures = {
                     executor.submit(
                         process_file,
@@ -227,7 +334,7 @@ def process_files(
                         pdf_converter,
                         log_file,
                     ): input_path
-                    for input_path in files
+                    for input_path in sorted_files
                 }
 
                 # Sử dụng tqdm cùng với logging
