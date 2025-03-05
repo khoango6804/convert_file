@@ -11,6 +11,23 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from datetime import datetime, timedelta
 
 
+def estimate_tokens(self, text=None, image=None):
+    """Estimate token usage of a request"""
+    token_count = 0
+
+    # Text token estimation (approx 4 chars per token)
+    if text:
+        token_count += len(text) / 4
+
+    # Image token estimation based on dimensions
+    if image and hasattr(image, "width") and hasattr(image, "height"):
+        # Gemini charges more for larger images
+        pixels = image.width * image.height
+        token_count += min(pixels / 750, 4000)  # Rough estimate
+
+    return int(token_count)
+
+
 class PDFConverter:
     def __init__(self):
         # Load API key from config
@@ -58,17 +75,33 @@ class PDFConverter:
         self._rotation_cycle_count = 0
         self._last_rotation_time = time.time()
 
+    def _save_progress(self, progress_file, processed_pages, tokens_used):
+        """Save processing progress to allow resuming later"""
+        try:
+            progress_data = {
+                "timestamp": datetime.now().isoformat(),
+                "pages": processed_pages,
+                "tokens_used": tokens_used,
+            }
+
+            with open(progress_file, "w", encoding="utf-8") as f:
+                json.dump(progress_data, f, ensure_ascii=False, indent=2)
+
+            print(f"💾 Đã lưu tiến độ ({len(processed_pages)} trang)")
+        except Exception as e:
+            print(f"⚠️ Không thể lưu tiến độ: {str(e)}")
+
     def _prepare_image_for_api(self, image):
-        """Prepare image for API submission with better error handling"""
+        """Prepare image for API with quota optimization"""
         try:
             # Ensure we have a valid image
             if not isinstance(image, Image.Image):
                 print("⚠️ Invalid image provided")
                 return None
 
-            # Resize if too large (Gemini API limits)
+            # Resize image more aggressively for token savings
             width, height = image.size
-            max_dimension = 1600  # Gemini API size limit
+            max_dimension = 1024  # Reduced from 1600 to save tokens
             if width > max_dimension or height > max_dimension:
                 if width > height:
                     new_width = max_dimension
@@ -81,9 +114,16 @@ class PDFConverter:
                     f"🔍 Đã resize hình ảnh từ {width}x{height} thành {new_width}x{new_height}"
                 )
 
-            # Simple conversion to bytes
+            # Convert to grayscale to reduce tokens
+            if image.mode != "L":
+                image = ImageOps.grayscale(image)
+                print("🔍 Đã chuyển ảnh sang grayscale để giảm token")
+
+            # Compress image quality
             img_bytes = io.BytesIO()
-            image.save(img_bytes, format="PNG")
+            image.save(
+                img_bytes, format="JPEG", quality=85
+            )  # Using JPEG with 85% quality
             img_bytes.seek(0)
 
             return img_bytes.getvalue()
@@ -92,149 +132,76 @@ class PDFConverter:
             print(f"⚠️ Error preparing image: {str(e)}")
             return None
 
-    def initialize_quota_tracker(self):
-        """Initialize or load quota tracker with improved reset logic"""
-        try:
-            if os.path.exists(self.quota_tracker_file):
-                with open(self.quota_tracker_file, "r") as f:
-                    self.quota_tracker = json.load(f)
-
-                # Check if keys array has the correct number of entries
-                if len(self.quota_tracker["keys"]) != len(self.api_keys):
-                    print(
-                        "⚠️ Số lượng key trong quota tracker không khớp với api.json. Cập nhật..."
-                    )
-                    # Adjust the tracker to match current keys
-                    self._adjust_quota_tracker()
-
-                # Check if we need to reset based on next_allowed_time
-                for key_idx, key_data in enumerate(self.quota_tracker["keys"]):
-                    next_allowed_time = datetime.fromisoformat(
-                        key_data["next_allowed_time"]
-                    )
-                    if datetime.now() >= next_allowed_time:
-                        # Reset quota for this key
-                        self.quota_tracker["keys"][key_idx]["daily_requests"] = 0
-                        self.quota_tracker["keys"][key_idx]["next_allowed_time"] = (
-                            datetime.now().replace(
-                                hour=0, minute=0, second=0, microsecond=0
-                            )
-                            + timedelta(days=1)
-                        ).isoformat()
-                        print(
-                            f"✅ Reset quota for key {key_idx + 1} - next reset: {self.quota_tracker['keys'][key_idx]['next_allowed_time']}"
-                        )
-            else:
-                print("🔄 Tạo mới file quota tracker...")
-                # Create new tracker
-                self.quota_tracker = {
-                    "last_run": datetime.now().isoformat(),
-                    "keys": [],
-                }
-
-                # Initialize data for each API key
-                for i in range(len(self.api_keys)):
-                    tomorrow = (
-                        datetime.now().replace(
-                            hour=0, minute=0, second=0, microsecond=0
-                        )
-                        + timedelta(days=1)
-                    ).isoformat()
-
-                    self.quota_tracker["keys"].append(
-                        {
-                            "daily_requests": 0,
-                            "next_allowed_time": tomorrow,  # Reset at midnight
-                        }
-                    )
-
-            # Save the tracker
-            self.save_quota_tracker()
-
-        except Exception as e:
-            print(f"⚠️ Error initializing quota tracker: {str(e)}")
-            # Create a basic tracker in case of error
-            self.quota_tracker = {
-                "last_run": datetime.now().isoformat(),
-                "keys": [
-                    {
-                        "daily_requests": 0,
-                        "next_allowed_time": (
-                            datetime.now() + timedelta(days=1)
-                        ).isoformat(),
-                    }
-                    for _ in self.api_keys
-                ],
-            }
-            self.save_quota_tracker()
-
+    @retry(
+        stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10)
+    )
     def _call_gemini_api(self, prompt, image=None):
-        """Call Gemini API with improved error handling and cycle prevention"""
-        # Initialize rotation tracking if needed
-        if not hasattr(self, "_rotation_cycle_count"):
-            self._rotation_cycle_count = 0
-            self._last_rotation_time = time.time()
-
+        """Simplified API call with error handling and key rotation"""
         try:
-            # Check for rotation cycle (4 rotations in less than 10 seconds)
-            current_time = time.time()
+            # Check if we're cycling keys too rapidly
             if (
-                current_time - self._last_rotation_time < 10
-                and self._rotation_cycle_count >= len(self.api_keys)
+                hasattr(self, "rotation_count")
+                and self.rotation_count >= len(self.api_keys) * 2
             ):
-                # We're cycling too fast - take a break
-                print("⚠️ Đang quay vòng API key quá nhanh. Tạm dừng 60 giây...")
-                time.sleep(60)
-                self._rotation_cycle_count = 0
+                print("⚠️ Đang quay vòng API key quá nhanh. Tạm dừng...")
+                time.sleep(30)  # Take a longer break
+                self.rotation_count = 0
 
-            # Reset the cycle detection if it's been a while
-            if current_time - self._last_rotation_time > 30:  # Reset after 30 seconds
-                self._rotation_cycle_count = 0
-
-            # Make API call with current key
+            # Make API call
             try:
+                # Choose most efficient model based on content
+                if image:
+                    # Use flash for images to save tokens
+                    model = "gemini-2.0-flash"
+                else:
+                    # For text-only, use Pro which is more efficient with text
+                    model = "gemini-2.0-pro"
+
+                # Make API call with selected model
                 if image:
                     response = self.client.models.generate_content(
-                        model="gemini-2.0-flash", contents=[prompt, image]
+                        model=model, contents=[prompt, image]
                     )
                 else:
                     response = self.client.models.generate_content(
-                        model="gemini-2.0-flash", contents=[prompt]
+                        model=model, contents=[prompt]
                     )
 
-                # Success - reset rotation cycle
-                self._rotation_cycle_count = 0
+                # Success! Reset rotation counter
+                if hasattr(self, "rotation_count"):
+                    self.rotation_count = 0
+
                 return response
 
             except Exception as e:
                 error_message = str(e).lower()
 
-                # If the error indicates we should try another key
-                if (
-                    "indexerror" in error_message
-                    or "quota" in error_message
-                    or "rate limit" in error_message
-                ):
-                    # Check if we've tried all keys recently
-                    if self._rotation_cycle_count >= len(self.api_keys):
-                        print(
-                            "⚠️ All API keys appear to be rate limited. Waiting 5 minutes..."
-                        )
-                        time.sleep(300)  # 5 minute delay
-                        self._rotation_cycle_count = 0
-                    else:
-                        # Try next key
-                        self._last_rotation_time = time.time()
-                        self._rotation_cycle_count += 1
+                # Check if all keys are exhausted
+                if any(msg in error_message for msg in ["quota", "rate", "limit"]):
+                    if len(self.api_keys) > 1:
+                        # Try another key as you're already doing
                         self.rotate_api_key()
                         return self._call_gemini_api(prompt, image)
+                    else:
+                        # Single key case - save progress before waiting
+                        print("⚠️ Hết hạn API, đã lưu tiến độ. Có thể tiếp tục sau.")
+                        # Let the error propagate so the main function can save progress
+                        raise Exception("API_QUOTA_EXHAUSTED")
 
-                # Re-raise for other errors
+                # Re-raise for other types of errors
                 raise
 
         except Exception as e:
-            # Handle other exceptions
             print(f"❌ API error: {str(e)}")
+
+            # If we've retried too many times, take a break
+            if self.retry_count >= self.max_retries:
+                print(f"⚠️ Maximum retries reached. Waiting {self.wait_time} seconds...")
+                time.sleep(self.wait_time)
+                self.retry_count = 0
+            else:
+                self.retry_count += 1
+
             raise
 
     def _adjust_quota_tracker(self):
@@ -350,7 +317,7 @@ class PDFConverter:
                 self.rotation_count >= len(self.api_keys) * 2
                 and current_time - self._last_rotation_time < 30
             ):
-                print(f"⚠️ Đã thử tất cả API keys nhiều lần. Tạm dừng 30 giây...")
+                print("⚠️ Đã thử tất cả API keys nhiều lần. Tạm dừng 30 giây...")
                 time.sleep(30)
                 self.rotation_count = 0  # Reset counter
 
@@ -359,75 +326,6 @@ class PDFConverter:
             print(f"❌ Lỗi khi chuyển API key: {str(e)}")
             self.current_key_index = previous_key  # Revert to previous key
             return False
-
-    @retry(
-        stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10)
-    )
-    def _call_gemini_api(self, prompt, image=None):
-        """Simplified API call with error handling and key rotation"""
-        try:
-            # Check if we're cycling keys too rapidly
-            if (
-                hasattr(self, "rotation_count")
-                and self.rotation_count >= len(self.api_keys) * 2
-            ):
-                print("⚠️ Đang quay vòng API key quá nhanh. Tạm dừng...")
-                time.sleep(30)  # Take a longer break
-                self.rotation_count = 0
-
-            # Make API call
-            try:
-                if image:
-                    response = self.client.models.generate_content(
-                        model="gemini-2.0-flash", contents=[prompt, image]
-                    )
-                else:
-                    response = self.client.models.generate_content(
-                        model="gemini-2.0-flash", contents=[prompt]
-                    )
-
-                # Success! Reset rotation counter
-                if hasattr(self, "rotation_count"):
-                    self.rotation_count = 0
-
-                return response
-
-            except Exception as e:
-                error_message = str(e).lower()
-
-                # Errors that suggest we should try another key
-                if any(
-                    msg in error_message
-                    for msg in ["quota", "rate", "limit", "indexerror", "error"]
-                ):
-                    if len(self.api_keys) > 1:
-                        # Try another key
-                        self.rotate_api_key()
-                        time.sleep(1)  # Short delay between rotations
-                        return self._call_gemini_api(
-                            prompt, image
-                        )  # Retry with new key
-                    else:
-                        # Only one key available, need to wait
-                        wait_time = 60  # 1 minute
-                        print(f"⚠️ API limit reached. Waiting {wait_time} seconds...")
-                        time.sleep(wait_time)
-
-                # Re-raise for other types of errors
-                raise
-
-        except Exception as e:
-            print(f"❌ API error: {str(e)}")
-
-            # If we've retried too many times, take a break
-            if self.retry_count >= self.max_retries:
-                print(f"⚠️ Maximum retries reached. Waiting {self.wait_time} seconds...")
-                time.sleep(self.wait_time)
-                self.retry_count = 0
-            else:
-                self.retry_count += 1
-
-            raise  # Let tenacity handle the retry
 
     def preprocess_image(self, image):
         """
@@ -473,50 +371,30 @@ class PDFConverter:
         """
         try:
             prompt = """
-            Nhiệm vụ: Chuẩn hóa văn bản hành chính sang Markdown thuần túy.
+            Chuẩn hóa văn bản hành chính thành Markdown:
 
-            Quy tắc định dạng:
-            1. Tiêu đề và cấu trúc:
-            - Chỉ MỘT tiêu đề # ở đầu văn bản cho tên cơ quan cao nhất
-            - Dùng ## cho tên cơ quan trực thuộc
-            - Dùng ### cho số văn bản và trích yếu (không có dấu : hoặc .)
-            - Thêm dòng trống trước và sau mỗi tiêu đề
-            - Không dùng tiêu đề trùng nội dung
+            1. Tiêu đề:
+            - # cho cơ quan cao nhất 
+            - ## cho cơ quan trực thuộc
+            - ### cho số văn bản/trích yếu
 
-            2. Căn lề văn bản:
-            - Dùng hai dấu cách ở cuối dòng để xuống dòng thay vì HTML
-            - Sử dụng cú pháp Markdown thuần túy, không dùng <div>, <br>, <sup>
-            - Đối với nội dung căn giữa, thêm hai dấu cách ở cuối mỗi dòng
-            - Đối với nội dung căn phải, thêm bốn dấu cách ở đầu dòng
+            2. Định dạng:
+            - **CỘNG HÒA XÃ HỘI CHỦ NGHĨA VIỆT NAM**
+            - *Độc lập - Tự do - Hạnh phúc*
+            - Xuống dòng: 2 dấu cách cuối dòng
+            - Căn phải: 4 dấu cách đầu dòng
 
-            3. Định dạng văn bản:
-            - Dùng **CỘNG HÒA XÃ HỘI CHỦ NGHĨA VIỆT NAM**  
-            - Dùng *Độc lập - Tự do - Hạnh phúc*  
-            - Dùng *Hà Nội, ngày ... tháng ... năm ...*    
-            - Không dùng in đậm/nghiêng thay cho tiêu đề
+            3. Danh sách:
+            - Có dòng trống trước/sau
+            - - danh sách không thứ tự
+            - 1. 2. danh sách có thứ tự
+            - > cho trích dẫn
 
-            4. Danh sách và trích dẫn:
-            - Thêm dòng trống trước và sau danh sách
-            - Dùng - cho danh sách không thứ tự (thụt lề 3 dấu cách cho cấp con)
-            - Dùng 1. 2. 3. cho danh sách có thứ tự
-            - Dùng > cho trích dẫn (thêm dòng trống trước/sau)
+            4. Bảng và ghi chú:
+            - | và - cho bảng, :--- căn trái, ---: căn phải
+            - Ghi chú dạng [^n] thay cho <sup>n</sup>
 
-            5. Bảng và đường kẻ:
-            - Căn đều các cột trong bảng
-            - Sử dụng --- cho đường kẻ ngang (có dòng trống trước/sau)
-            - Đảm bảo số cột nhất quán trong bảng
-            - Sử dụng :--- cho căn trái, ---: cho căn phải
-
-            6. Ghi chú và footnote:
-            - Thay <sup>n</sup> bằng [^n]
-            - Đặt ghi chú cuối trang với [^n]: nội dung
-            - Thêm dòng trống trước mỗi ghi chú
-
-            Lưu ý:
-            - Không sử dụng bất kỳ thẻ HTML nào
-            - Không để dấu câu ở cuối tiêu đề
-            - Đảm bảo khoảng cách nhất quán
-            - Kết thúc file với một dòng trống
+            Không dùng HTML, không để dấu câu cuối tiêu đề, thêm dòng trống cuối file.
             """
 
             # Get response from Gemini
@@ -583,11 +461,57 @@ class PDFConverter:
             print(f"⚠️ Lỗi khi làm sạch Markdown: {e}")
             return text
 
-    def pdf_to_text(self, pdf_path, output_format="md"):
+    def estimate_tokens(self, text=None, image=None):
+        """Estimate token usage of a request"""
+        token_count = 0
+
+        # Text token estimation (approx 4 chars per token)
+        if text:
+            token_count += len(text) / 4
+
+        # Image token estimation based on dimensions
+        if image and hasattr(image, "width") and hasattr(image, "height"):
+            # Gemini charges more for larger images
+            pixels = image.width * image.height
+            token_count += min(pixels / 750, 4000)  # Rough estimate
+
+        return int(token_count)
+
+    def pdf_to_text(
+        self, pdf_path, output_format="md", token_budget=None, resume=False
+    ):
         """
-        Convert PDF to text using PyMuPDF and Gemini Vision
+        Convert PDF with optional token budget
+        Args:
+            token_budget: Maximum tokens to use (None for unlimited)
         """
+        estimated_tokens_used = 0
         pdf_document = None
+
+        # Define progress file path based on PDF name
+        pdf_filename = os.path.splitext(os.path.basename(pdf_path))[0]
+        progress_dir = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), "data", "progress"
+        )
+        os.makedirs(progress_dir, exist_ok=True)
+        progress_file = os.path.join(progress_dir, f"{pdf_filename}_progress.json")
+
+        # Initialize or load progress data
+        processed_pages = {}
+        start_page = 0
+
+        if resume and os.path.exists(progress_file):
+            try:
+                with open(progress_file, "r", encoding="utf-8") as f:
+                    progress_data = json.load(f)
+                    processed_pages = progress_data.get("pages", {})
+                    estimated_tokens_used = progress_data.get("tokens_used", 0)
+                    print(
+                        f"🔄 Tiếp tục xử lý từ tiến độ đã lưu. Đã xử lý {len(processed_pages)} trang."
+                    )
+            except Exception as e:
+                print(f"⚠️ Không thể tải tiến độ đã lưu: {str(e)}")
+
         try:
             # Open PDF
             pdf_document = fitz.open(pdf_path)
@@ -605,6 +529,13 @@ class PDFConverter:
             total_pages = pdf_document.page_count
 
             for page_num in range(total_pages):
+                # Skip already processed pages if resuming
+                page_key = str(page_num)
+                if resume and page_key in processed_pages:
+                    all_text.append(processed_pages[page_key])
+                    print(f"⏩ Bỏ qua trang {page_num + 1} (đã xử lý trước đó)")
+                    continue
+
                 retry_count = 0
                 max_page_retries = 2
                 page_processed = False
@@ -627,7 +558,7 @@ class PDFConverter:
                         # Convert page to image
                         try:
                             pix = page.get_pixmap(
-                                matrix=fitz.Matrix(300 / 72, 300 / 72)
+                                matrix=fitz.Matrix(200 / 72, 200 / 72)
                             )
                             img = Image.frombytes(
                                 "RGB", [pix.width, pix.height], pix.samples
@@ -644,42 +575,44 @@ class PDFConverter:
 
                         # Create prompt for Gemini
                         prompt = """
-                        Nhiệm vụ: Chuyển đổi văn bản thành định dạng Markdown chuẩn.
+                        Chuyển thành Markdown:
 
-                        Yêu cầu định dạng:
-                        1. Tiêu đề và cấu trúc:
-                        - # cho tiêu đề chính (tên cơ quan, tên văn bản)
-                        - ## cho tiêu đề cấp 2 (số văn bản, trích yếu)
-                        - ### cho các phần chính của văn bản
-                        - #### cho tiêu đề phụ
+                        1. Tiêu đề:
+                        - # tiêu đề chính
+                        - ## tiêu đề cấp 2
+                        - ### phần chính
 
-                        2. Định dạng văn bản:
-                        - **text** cho văn bản in đậm
-                        - *text* cho văn bản in nghiêng
-                        - > cho trích dẫn và ghi chú
-                        - --- cho đường kẻ ngang phân cách
+                        2. Định dạng:
+                        - **CỘNG HÒA XÃ HỘI CHỦ NGHĨA VIỆT NAM**
+                        - *Thời gian, địa điểm*
+                        - > trích dẫn
+                        - --- đường kẻ
 
-                        3. Bảng và danh sách:
-                        - Sử dụng | và - cho bảng
-                        - Căn lề số liệu sang phải trong bảng
-                        - Sử dụng - hoặc * cho danh sách không thứ tự
-                        - Sử dụng 1. 2. 3. cho danh sách có thứ tự
+                        3. Bảng/Danh sách:
+                        - | và - cho bảng (số căn phải)
+                        - - cho danh sách không thứ tự
+                        - 1. cho danh sách thứ tự
 
-                        4. Đặc biệt với văn bản hành chính:
-                        - In đậm các cụm từ quan trọng như "CỘNG HÒA XÃ HỘI CHỦ NGHĨA VIỆT NAM"
-                        - In nghiêng thông tin thời gian, địa điểm
-                        - Giữ nguyên định dạng của các số văn bản, công văn
-                        - Tạo bảng cho các dữ liệu số liệu
-
-                        5. Giữ nguyên:
-                        - Các số liệu và đơn vị
-                        - Mã số văn bản
-                        - Dấu câu và ký tự đặc biệt
-                        - Định dạng tiếng Việt
-
-                        Lưu ý: Đảm bảo tính chính xác và thẩm mỹ của văn bản khi chuyển sang Markdown.
+                        Giữ nguyên: mã văn bản, số liệu, dấu câu, định dạng tiếng Việt.
                         """
+                        prompt_tokens = self.estimate_tokens(prompt)
+                        image_tokens = self.estimate_tokens(image=img_processed)
+                        request_tokens = prompt_tokens + image_tokens
 
+                        # Check if we're over budget
+                        if token_budget and (
+                            estimated_tokens_used + request_tokens > token_budget
+                        ):
+                            print(
+                                f"⚠️ Token budget ({token_budget}) would be exceeded. Stopping."
+                            )
+                            break
+
+                        # After successful API call:
+                        estimated_tokens_used += request_tokens
+                        print(
+                            f"📊 Estimated tokens used so far: {estimated_tokens_used}"
+                        )
                         # Try to call API with error handling
                         try:
                             response = self._call_gemini_api(prompt, img_processed)
@@ -709,6 +642,12 @@ class PDFConverter:
                 # Count as failed if all retries were used up without success
                 if not page_processed:
                     failed_count += 1
+                else:
+                    processed_pages[page_key] = response.text
+                    # Save progress after each successful page
+                    self._save_progress(
+                        progress_file, processed_pages, estimated_tokens_used
+                    )
 
             # Check if we processed any pages successfully
             if not all_text:
@@ -766,11 +705,14 @@ class PDFConverter:
 
                     print(f"⚠️ Đã lưu văn bản khẩn cấp: {emergency_path}")
                     return emergency_path
-                except:
+                except Exception as emergency_err:
+                    print(f"❌ Không thể lưu văn bản khẩn cấp: {str(emergency_err)}")
                     return False
 
         except Exception as e:
             print(f"❌ Lỗi chuyển đổi PDF: {str(e)}")
+            # Save progress on exception too
+            self._save_progress(progress_file, processed_pages, estimated_tokens_used)
             return False
 
         finally:
@@ -815,6 +757,26 @@ class PDFConverter:
                     self.save_quota_tracker()
             except Exception as quota_err:
                 print(f"⚠️ Lỗi lưu trữ quota tracker: {str(quota_err)}")
+
+            # Clean up progress files for completed documents
+            progress_dir = os.path.join(
+                os.path.dirname(os.path.dirname(__file__)), "data", "progress"
+            )
+            if os.path.exists(progress_dir):
+                # Only remove progress files older than 7 days
+                cutoff = datetime.now() - timedelta(days=7)
+                try:
+                    for filename in os.listdir(progress_dir):
+                        if filename.endswith("_progress.json"):
+                            filepath = os.path.join(progress_dir, filename)
+                            file_time = datetime.fromtimestamp(
+                                os.path.getmtime(filepath)
+                            )
+                            if file_time < cutoff:
+                                os.remove(filepath)
+                                print(f"🧹 Đã xóa tiến độ cũ: {filename}")
+                except Exception as e:
+                    print(f"⚠️ Không thể dọn dẹp file tiến độ: {str(e)}")
 
             print("✅ Đã dọn dẹp tài nguyên tạm thời")
         except Exception as e:
