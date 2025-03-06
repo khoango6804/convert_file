@@ -1,53 +1,85 @@
-# File Converter Tool
+# PDF to Text Converter
 
-A simple utility to convert files between different formats.
+Công cụ chuyển đổi tài liệu PDF thành văn bản có cấu trúc với sự hỗ trợ của AI.
 
-## Features
+## Tính năng chính
 
-- Convert between various file formats
-- Easy-to-use command line interface
-- Batch processing capabilities
-- Preserves metadata during conversion
+- 🧠 Sử dụng Google Gemini AI để phân tích và chuyển đổi tài liệu
+- 📄 Hỗ trợ xử lý file PDF, DOC, DOCX
+- 📊 Tự động tối ưu hóa xử lý theo cấu hình máy tính
+- 🔍 Cải thiện chất lượng OCR thông qua tiền xử lý hình ảnh
+- 📝 Xuất file markdown có định dạng
+- ⏸️ Hỗ trợ lưu tiến trình và tiếp tục xử lý khi gặp sự cố
+- 🔄 Xử lý hàng loạt file với khả năng theo dõi tiến trình chi tiết
+- 💾 Tự động phân loại và lưu file đã xử lý
 
-## Installation
+## Cài đặt
 
 ```bash
-# Clone the repository
-git clone https://github.com/username/convert_file.git
+# Clone repository
+git clone https://github.com/yourusername/convert_file.git
 
-# Navigate to the project directory
+# Di chuyển đến thư mục dự án
 cd convert_file
 
-# Install dependencies
-npm install
+# Cài đặt các gói phụ thuộc
+pip install -r requirements.txt
 ```
 
-## Usage
+## Cấu hình
+
+1. Đăng ký Google API Key tại <https://makersuite.google.com/app/apikey>
+2. Chạy chương trình và nhập API key khi được yêu cầu
+
+## Sử dụng
 
 ```bash
-# Basic conversion
-node convert.js --input file.txt --output file.pdf
+# Chạy chương trình với giao diện dòng lệnh
+python main.py
 
-# Batch conversion
-node convert.js --input folder/ --output output/ --format pdf
+# Hoặc chỉ định thư mục đầu vào
+python main.py --input /path/to/files
+
+# Để tiếp tục xử lý file PDF bị gián đoạn
+python main.py --resume
 ```
 
-## Supported Formats
+## Cấu trúc thư mục
 
-- Text to PDF
-- PDF to Text
-- Image to Text (OCR)
-- And more...
+```
+convert_file/
+├─ data/
+│  ├─ input/      # Thư mục chứa file cần xử lý
+│  ├─ output/     # Thư mục lưu file đã chuyển đổi
+│  ├─ processed/  # File gốc đã xử lý thành công
+│  ├─ error/      # File có lỗi khi xử lý
+│  └─ logs/       # File nhật ký
+├─ utils/         # Các module tiện ích
+│  ├─ pdf_converter.py
+│  ├─ doc_converter.py
+│  └─ ...
+├─ main.py        # Điểm vào chính của chương trình
+└─ README.md
+```
 
-## Requirements
+## Yêu cầu hệ thống
 
-- Node.js v14 or higher
-- Required dependencies listed in package.json
+- Python 3.8 hoặc cao hơn
+- Kết nối internet để sử dụng Google Gemini API
+- RAM tối thiểu 4GB (khuyến nghị 8GB để xử lý PDF dung lượng lớn)
 
-## Contributing
+## Tối ưu hóa hiệu suất
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+- Chương trình tự động điều chỉnh số lượng worker dựa trên số CPU và RAM
+- Xử lý ưu tiên các file nhỏ và đơn giản trước để có kết quả nhanh chóng
+- Sử dụng cache để tránh xử lý lặp lại nội dung
 
-## License
+## Xử lý lỗi
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+- Tự động lưu tiến độ khi người dùng nhấn Ctrl+C
+- Di chuyển file lỗi vào thư mục riêng và ghi lại thông tin lỗi chi tiết
+- Tự động thử lại khi gặp lỗi API tạm thời
+
+## Giấy phép
+
+Dự án được cấp phép theo giấy phép MIT - xem file LICENSE để biết thêm chi tiết.
