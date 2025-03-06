@@ -1,6 +1,7 @@
 import os
 import shutil
 import time
+import logging
 
 
 def ensure_folder_exists(folder_path):
@@ -26,10 +27,10 @@ def move_to_error_folder(source_path, error_folder):
         # Only move if source exists and is different from destination
         if os.path.exists(source_path) and source_path != dest_path:
             shutil.copy2(source_path, dest_path)
-            print(f"⚠️ Di chuyển file lỗi đến: {dest_path}")
+            logging.warning(f"⚠️ Di chuyển file lỗi đến: {dest_path}")
         return dest_path
     except Exception as e:
-        print(f"❌ Không thể di chuyển file lỗi: {str(e)}")
+        logging.error(f"❌ Không thể di chuyển file lỗi: {str(e)}")
         return None
 
 
@@ -41,16 +42,18 @@ def move_with_retry(source_path, dest_path, max_attempts=5, delay=1):
             return True
         except PermissionError:
             if attempt < max_attempts - 1:
-                print(
+                logging.warning(
                     f"⚠️ File đang được sử dụng, thử lại sau {delay}s ({attempt + 1}/{max_attempts})..."
                 )
                 time.sleep(delay)
                 delay *= 2  # Exponential backoff
             else:
-                print(f"⚠️ Không thể di chuyển file sau {max_attempts} lần thử")
+                logging.warning(
+                    f"⚠️ Không thể di chuyển file sau {max_attempts} lần thử"
+                )
                 return False
         except Exception as e:
-            print(f"⚠️ Lỗi di chuyển file: {str(e)}")
+            logging.error(f"⚠️ Lỗi di chuyển file: {str(e)}")
             return False
 
 
@@ -75,28 +78,32 @@ def move_to_processed_folder(source_path, processed_folder, remove_original=True
                 # Use this inside move_to_processed_folder
                 if remove_original:
                     if move_with_retry(source_path, dest_path):
-                        print(f"✅ Di chuyển file đã xử lý thành công đến: {dest_path}")
+                        logging.info(
+                            f"✅ Di chuyển file đã xử lý thành công đến: {dest_path}"
+                        )
                     else:
                         # Fall back to copy if move fails
                         try:
                             shutil.copy2(source_path, dest_path)
-                            print(
+                            logging.info(
                                 f"✅ Đã sao chép file đến: {dest_path} (không thể di chuyển)"
                             )
                         except Exception as copy_err:
-                            print(f"⚠️ Không thể sao chép file: {str(copy_err)}")
+                            logging.error(f"⚠️ Không thể sao chép file: {str(copy_err)}")
                             return None
                 else:
                     shutil.copy2(source_path, dest_path)
-                    print(f"✅ Sao chép file đã xử lý thành công đến: {dest_path}")
+                    logging.info(
+                        f"✅ Sao chép file đã xử lý thành công đến: {dest_path}"
+                    )
             except PermissionError:
                 # If file is still in use, try copy instead and schedule deletion
-                print(f"⚠️ File đang được sử dụng: {source_path}")
+                logging.warning(f"⚠️ File đang được sử dụng: {source_path}")
                 if remove_original:
                     try:
                         # Copy now, schedule deletion for later
                         shutil.copy2(source_path, dest_path)
-                        print(f"✅ Đã sao chép file đến: {dest_path}")
+                        logging.info(f"✅ Đã sao chép file đến: {dest_path}")
 
                         # Schedule file for deletion after process exits
                         import atexit
@@ -105,32 +112,32 @@ def move_to_processed_folder(source_path, processed_folder, remove_original=True
                             try:
                                 if os.path.exists(path):
                                     os.remove(path)
-                                    print(f"✅ Đã xóa file gốc: {path}")
+                                    logging.info(f"✅ Đã xóa file gốc: {path}")
                             except Exception as e:
-                                print(
+                                logging.error(
                                     f"⚠️ Không thể xóa file gốc: {path}, lỗi: {str(e)}"
                                 )
 
                         atexit.register(delete_later, source_path)
                         return dest_path
                     except Exception as copy_err:
-                        print(f"⚠️ Không thể sao chép file: {str(copy_err)}")
+                        logging.error(f"⚠️ Không thể sao chép file: {str(copy_err)}")
                         return None
                 else:
                     # Just copy without deletion
                     try:
                         shutil.copy2(source_path, dest_path)
-                        print(f"✅ Đã sao chép file đến: {dest_path}")
+                        logging.info(f"✅ Đã sao chép file đến: {dest_path}")
                         return dest_path
                     except Exception as copy_err:
-                        print(f"⚠️ Không thể sao chép file: {str(copy_err)}")
+                        logging.error(f"⚠️ Không thể sao chép file: {str(copy_err)}")
                         return None
             except Exception as e:
-                print(f"⚠️ Lỗi di chuyển/sao chép file: {str(e)}")
+                logging.error(f"⚠️ Lỗi di chuyển/sao chép file: {str(e)}")
                 return None
         return dest_path
     except Exception as e:
-        print(f"❌ Không thể xử lý file đã hoàn thành: {str(e)}")
+        logging.error(f"❌ Không thể xử lý file đã hoàn thành: {str(e)}")
         return None
 
 
