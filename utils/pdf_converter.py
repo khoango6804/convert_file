@@ -62,6 +62,18 @@ class PDFConverter:
                     f"✅ Đã kết nối Gemini API (Key {self.current_key_index + 1}/{len(self.api_keys)})"
                 )
 
+                # Initialize rate limiting tracking for each key
+                # Gemini limits: 15 RPM, 1M TPM, 1,500 RPD
+                self.key_usage = {}
+                for i, _ in enumerate(self.api_keys):
+                    self.key_usage[i] = {
+                        "minute_requests": [],  # List of timestamps for RPM tracking
+                        "day_requests": 0,  # Counter for RPD tracking
+                        "day_reset": time.time() + 86400,  # Next day reset time
+                        "tokens_used_minute": 0,  # Tokens used in current minute
+                        "minute_reset": time.time() + 60,  # Next minute reset time
+                    }
+
         except Exception as e:
             logging.error(f"❌ Lỗi cấu hình Gemini API: {e}")
             raise
@@ -74,96 +86,121 @@ class PDFConverter:
         self.max_retries = 3
         self.wait_time = 60  # seconds
 
+        # Rate limits for Gemini API
+        self.RPM_LIMIT = 15  # Requests per minute
+        self.TPM_LIMIT = 1000000  # Tokens per minute
+        self.RPD_LIMIT = 1500  # Requests per day
+
         # Track rotation to prevent endless cycling
         self._rotation_cycle_count = 0
         self._last_rotation_time = time.time()
 
-    def _save_progress_with_retries(
-        self, progress_file, processed_pages, tokens_used, page_retries=None
-    ):
-        """Save processing progress with retry mechanism"""
-        max_retries = 3
-        retry_count = 0
+    def _update_rate_limits(self, estimated_tokens=0):
+        """Update rate limit tracking for current key"""
+        key_index = self.current_key_index
+        current_time = time.time()
 
-        while retry_count < max_retries:
-            try:
-                progress_data = {
-                    "timestamp": datetime.now().isoformat(),
-                    "pages": processed_pages,
-                    "tokens_used": tokens_used,
-                    "page_retries": page_retries or {},
-                    "last_api_key": self.current_key_index,
-                    "last_update": time.time(),
-                }
+        # Update minute-based tracking
+        self.key_usage[key_index]["minute_requests"].append(current_time)
+        self.key_usage[key_index]["tokens_used_minute"] += estimated_tokens
 
-                # Tạo thư mục cha nếu chưa tồn tại
-                os.makedirs(os.path.dirname(progress_file), exist_ok=True)
+        # Remove timestamps older than 1 minute
+        self.key_usage[key_index]["minute_requests"] = [
+            t
+            for t in self.key_usage[key_index]["minute_requests"]
+            if t > current_time - 60
+        ]
 
-                # Ghi file tạm trước
-                temp_file = progress_file + ".tmp"
-                with open(temp_file, "w", encoding="utf-8") as f:
-                    json.dump(progress_data, f, ensure_ascii=False, indent=2)
+        # Check if minute reset time passed
+        if current_time > self.key_usage[key_index]["minute_reset"]:
+            self.key_usage[key_index]["tokens_used_minute"] = estimated_tokens
+            self.key_usage[key_index]["minute_reset"] = current_time + 60
+            logging.info(f"🔄 Reset minute-based limits for API key {key_index + 1}")
 
-                # Rename file tạm thành file chính (atomic operation)
-                if os.path.exists(progress_file):
-                    os.replace(temp_file, progress_file)
-                else:
-                    os.rename(temp_file, progress_file)
+        # Update day-based tracking
+        self.key_usage[key_index]["day_requests"] += 1
 
-                # Không hiển thị thông báo quá nhiều lần để tránh spam
-                if len(processed_pages) % 5 == 0 or len(processed_pages) == 1:
-                    logging.info(f"💾 Đã lưu tiến độ ({len(processed_pages)} trang)")
+        # Check if day reset time passed
+        if current_time > self.key_usage[key_index]["day_reset"]:
+            self.key_usage[key_index]["day_requests"] = 1
+            self.key_usage[key_index]["day_reset"] = current_time + 86400
+            logging.info(f"🔄 Reset daily limits for API key {key_index + 1}")
+
+    def _check_rate_limits(self):
+        """Check if current key is within rate limits"""
+        key_index = self.current_key_index
+        current_usage = self.key_usage[key_index]
+
+        # Check RPM limit
+        rpm_current = len(current_usage["minute_requests"])
+        if rpm_current >= self.RPM_LIMIT:
+            logging.warning(
+                f"⚠️ API key {key_index + 1} đạt giới hạn RPM ({rpm_current}/{self.RPM_LIMIT})"
+            )
+            return False
+
+        # Check TPM limit
+        if current_usage["tokens_used_minute"] >= self.TPM_LIMIT:
+            logging.warning(
+                f"⚠️ API key {key_index + 1} đạt giới hạn TPM ({current_usage['tokens_used_minute']}/{self.TPM_LIMIT})"
+            )
+            return False
+
+        # Check RPD limit
+        if current_usage["day_requests"] >= self.RPD_LIMIT:
+            logging.warning(
+                f"⚠️ API key {key_index + 1} đạt giới hạn RPD ({current_usage['day_requests']}/{self.RPD_LIMIT})"
+            )
+            return False
+
+        return True
+
+    def _find_available_key(self):
+        """Find an API key that hasn't reached its rate limits"""
+        original_key = self.current_key_index
+
+        # Try each key once
+        for _ in range(len(self.api_keys)):
+            # Check if current key is within limits
+            if self._check_rate_limits():
                 return True
 
-            except Exception as e:
-                retry_count += 1
-                if retry_count >= max_retries:
-                    logging.error(
-                        f"⚠️ Không thể lưu tiến độ sau {max_retries} lần thử: {str(e)}"
-                    )
-                    return False
-                time.sleep(1)  # Đợi 1 giây trước khi thử lại
+            # Rotate to next key
+            self.rotate_api_key()
 
-    def _prepare_image_for_api(self, image):
-        """Prepare image for API with quota optimization"""
-        try:
-            # Ensure we have a valid image
-            if not isinstance(image, Image.Image):
-                logging.warning("⚠️ Invalid image provided")
-                return None
+            # If we've tried all keys and came back to the original one
+            if self.current_key_index == original_key:
+                break
 
-            # Resize image more aggressively for token savings
-            width, height = image.size
-            max_dimension = 1024  # Reduced from 1600 to save tokens
-            if width > max_dimension or height > max_dimension:
-                if width > height:
-                    new_width = max_dimension
-                    new_height = int(height * (max_dimension / width))
-                else:
-                    new_height = max_dimension
-                    new_width = int(width * (max_dimension / height))
-                image = image.resize((new_width, new_height), Image.LANCZOS)
-                logging.info(
-                    f"🔍 Đã resize hình ảnh từ {width}x{height} thành {new_width}x{new_height}"
-                )
+        # If all keys are rate-limited
+        wait_time = self._calculate_min_wait_time()
+        logging.error(
+            f"❌ All API keys are rate-limited. Wait at least {wait_time} seconds."
+        )
+        return False
 
-            # Convert to grayscale to reduce tokens
-            if image.mode != "L":
-                image = ImageOps.grayscale(image)
-                logging.info("🔍 Đã chuyển ảnh sang grayscale để giảm token")
+    def _calculate_min_wait_time(self):
+        """Calculate minimum time to wait for any key to become available again"""
+        current_time = time.time()
+        min_wait = 60  # Default 1 minute
 
-            # Compress image quality
-            img_bytes = io.BytesIO()
-            image.save(
-                img_bytes, format="JPEG", quality=85
-            )  # Using JPEG with 85% quality
-            img_bytes.seek(0)
+        for key_index in self.key_usage:
+            usage = self.key_usage[key_index]
 
-            return img_bytes.getvalue()
+            # Check minute-based reset
+            if len(usage["minute_requests"]) >= self.RPM_LIMIT:
+                # Find oldest request timestamp
+                oldest = min(usage["minute_requests"])
+                # Time until this falls outside the 1-minute window
+                wait_time = (oldest + 60) - current_time
+                min_wait = min(min_wait, max(1, wait_time))
 
-        except Exception as e:
-            logging.error(f"⚠️ Error preparing image: {str(e)}")
-            return None
+            # If we're at TPM limit, we need to wait until minute reset
+            if usage["tokens_used_minute"] >= self.TPM_LIMIT:
+                wait_time = usage["minute_reset"] - current_time
+                min_wait = min(min_wait, max(1, wait_time))
+
+        return int(min_wait)
 
     @retry(
         stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10)
@@ -171,62 +208,213 @@ class PDFConverter:
     def _call_gemini_api(self, prompt, image=None):
         """Simplified API call with error handling and key rotation"""
         try:
+            # Reset cycle detection if enough time has passed
+            current_time = time.time()
+            if (current_time - getattr(self, "_last_reset_time", 0)) > 60:
+                if hasattr(self, "rotation_count"):
+                    self.rotation_count = 0
+                if hasattr(self, "_tried_all_keys"):
+                    self._tried_all_keys = False
+                if hasattr(self, "_exhausted_keys"):
+                    self._exhausted_keys = set()
+                self._last_reset_time = current_time
+
             # Check if we're cycling keys too rapidly
-            if (
-                hasattr(self, "rotation_count")
-                and self.rotation_count >= len(self.api_keys) * 2
+            if hasattr(self, "rotation_count") and self.rotation_count >= len(
+                self.api_keys
             ):
-                logging.error("⚠️ Đang quay vòng API key quá nhanh. Tạm dừng...")
-                time.sleep(30)  # Take a longer break
+                logging.warning(
+                    "⚠️ Đã thử tất cả API key trong thời gian ngắn. Tạm dừng 10 giây..."
+                )
+                time.sleep(10)  # Take a shorter break before retrying
                 self.rotation_count = 0
+
+            # Check if current key is within rate limits, if not find one that is
+            if not self._check_rate_limits():
+                if not self._find_available_key():
+                    wait_time = self._calculate_min_wait_time()
+                    logging.warning(f"⏱️ Đang đợi {wait_time} giây cho API key reset...")
+                    time.sleep(wait_time)
+
+            # Estimate token usage for tracking
+            prompt_tokens = self.estimate_tokens(text=prompt)
+            image_tokens = 0
+            if image:
+                if isinstance(image, Image.Image):
+                    image_tokens = self.estimate_tokens(image=image)
+                else:
+                    image_tokens = 1000  # Rough estimate for image bytes
+
+            estimated_tokens = prompt_tokens + image_tokens
 
             # Make API call
             try:
-                # Choose most efficient model based on content
-                if image:
-                    # Use flash for images to save tokens
-                    model = "gemini-2.0-flash"
-                else:
-                    # For text-only, use Pro which is more efficient with text
-                    model = "gemini-2.0-pro"
+                model = "gemini-2.0-flash"
 
                 # Make API call with selected model
                 if image:
-                    response = self.client.models.generate_content(
-                        model=model, contents=[prompt, image]
-                    )
+                    # Check if the image is a PIL Image object and convert to bytes if needed
+                    if isinstance(image, Image.Image):
+                        # Convert PIL Image to bytes
+                        img_bytes = io.BytesIO()
+                        image.save(img_bytes, format="JPEG", quality=85)
+                        img_bytes = img_bytes.getvalue()
+                    else:
+                        # Assume it's already bytes
+                        img_bytes = image
+
+                    # Create a temporary file for the image
+                    with tempfile.NamedTemporaryFile(
+                        suffix=".jpg", delete=False
+                    ) as temp_img:
+                        temp_img.write(img_bytes)
+                        temp_img_path = temp_img.name
+
+                    try:
+                        # Upload the image file to Gemini
+                        file_ref = self.client.files.upload(file=temp_img_path)
+
+                        # Call Gemini with text prompt and file reference
+                        response = self.client.models.generate_content(
+                            model=model, contents=[prompt, file_ref]
+                        )
+                    finally:
+                        # Clean up the temporary file
+                        try:
+                            os.unlink(temp_img_path)
+                        except:
+                            pass
                 else:
+                    # Text-only request
                     response = self.client.models.generate_content(
                         model=model, contents=[prompt]
                     )
 
-                # Success! Reset rotation counter
+                # Success - update rate limit tracking
+                self._update_rate_limits(estimated_tokens)
+
+                # Reset rotation counter and tried_all_keys flag
                 if hasattr(self, "rotation_count"):
                     self.rotation_count = 0
+                if hasattr(self, "_tried_all_keys"):
+                    self._tried_all_keys = False
+                if hasattr(self, "_exhausted_keys"):
+                    self._exhausted_keys.clear()
 
                 return response
 
             except Exception as e:
                 error_message = str(e).lower()
+                error_code = None
 
-                # Check if all keys are exhausted
-                if any(msg in error_message for msg in ["quota", "rate", "limit"]):
-                    if len(self.api_keys) > 1:
-                        # Try another key as you're already doing
-                        self.rotate_api_key()
-                        return self._call_gemini_api(prompt, image)
-                    else:
-                        # Single key case - save progress before waiting
-                        logging.error(
-                            "⚠️ Hết hạn API, đã lưu tiến độ. Có thể tiếp tục sau."
+                # Extract error code if present
+                if "429" in error_message:
+                    error_code = 429
+                elif "'code': " in error_message:
+                    try:
+                        code_str = (
+                            error_message.split("'code': ")[1].split(",")[0].strip()
                         )
-                        # Let the error propagate so the main function can save progress
-                        raise Exception("API_QUOTA_EXHAUSTED")
+                        if code_str.isdigit():
+                            error_code = int(code_str)
+                    except:
+                        pass
 
-                # Re-raise for other types of errors
-                raise
+                # Check if this is a rate limit/resource exhausted error
+                is_rate_limit_error = (
+                    error_code == 429
+                    or "resource exhausted" in error_message
+                    or "rate limit" in error_message
+                    or "too many requests" in error_message
+                )
+
+                # Check if this is a quota error (different from rate limit)
+                is_quota_error = (
+                    "quota exceeded" in error_message or "usage limit" in error_message
+                )
+
+                # Handle resource exhaustion by adding delay before retrying
+                if is_rate_limit_error:
+                    logging.warning(
+                        f"⚠️ API key {self.current_key_index + 1}/{len(self.api_keys)} đang bị giới hạn tạm thời (rate limit)"
+                    )
+
+                    # Add a delay to recover from rate limiting
+                    delay = 5 + (
+                        self.retry_count * 5
+                    )  # Increasing delay with each retry
+                    logging.info(f"⏱️ Đợi {delay} giây cho rate limit reset...")
+                    time.sleep(delay)
+
+                    # Try with a different key if we have multiple keys
+                    if len(self.api_keys) > 1:
+                        # Try rotating to a new key
+                        previous_key = self.current_key_index
+                        self.rotate_api_key()
+                        logging.info(
+                            f"🔄 Đổi từ API key {previous_key + 1} sang {self.current_key_index + 1}/{len(self.api_keys)} do rate limit"
+                        )
+                        return self._call_gemini_api(prompt, image)
+
+                    # For single key, just raise to let tenacity retry
+                    raise
+
+                # Handle permanent quota exhaustion
+                elif is_quota_error:
+                    # Update tracking for this key to mark it as exhausted for today
+                    self.key_usage[self.current_key_index]["day_requests"] = (
+                        self.RPD_LIMIT
+                    )
+
+                    logging.warning(
+                        f"⚠️ API key {self.current_key_index + 1}/{len(self.api_keys)} đã hết quota."
+                    )
+
+                    # Initialize exhausted keys tracking if needed
+                    if not hasattr(self, "_exhausted_keys"):
+                        self._exhausted_keys = set()
+
+                    # Mark current key as tried
+                    self._exhausted_keys.add(self.current_key_index)
+
+                    # If we have multiple keys, try to find an unused one
+                    if len(self.api_keys) > 1:
+                        # Try each key at most once
+                        for _ in range(len(self.api_keys) - 1):
+                            self.rotate_api_key()
+
+                            # Skip this key if we've already tried it
+                            if self.current_key_index in self._exhausted_keys:
+                                continue
+
+                            logging.info(
+                                f"🔄 Đã chuyển sang API key {self.current_key_index + 1}/{len(self.api_keys)} do hết quota"
+                            )
+                            return self._call_gemini_api(prompt, image)
+
+                        # If we've tried all keys during this attempt
+                        if len(self._exhausted_keys) >= len(self.api_keys):
+                            logging.error(
+                                f"❌ Đã thử tất cả {len(self.api_keys)} API keys. Có thể tất cả đều hết quota."
+                            )
+                            raise Exception("ALL_KEYS_EXHAUSTED")
+                    else:
+                        # Only one key and it's exhausted
+                        logging.error("❌ API key duy nhất đã hết quota.")
+                        raise Exception("API_QUOTA_EXHAUSTED")
+                else:
+                    # Handle other errors - log the full error for debugging
+                    logging.warning(f"⚠️ API error (non-quota): {str(e)}")
+
+                    # Add a small delay for other errors
+                    time.sleep(1)
+                    raise
 
         except Exception as e:
+            if "ALL_KEYS_EXHAUSTED" in str(e) or "API_QUOTA_EXHAUSTED" in str(e):
+                # Forward these specific errors to calling function
+                raise
+
             logging.error(f"❌ API error: {str(e)}")
 
             # If we've retried too many times, take a break
@@ -335,30 +523,17 @@ class PDFConverter:
         try:
             self.client = genai.Client(api_key=self.api_keys[self.current_key_index])
 
-            # Only log if we're not cycling too rapidly
-            current_time = time.time()
-            if current_time - self._last_rotation_time > 5:
-                logging.info(
-                    f"🔄 Đã chuyển sang API key {self.current_key_index + 1}/{len(self.api_keys)}"
-                )
+            # Track rotation time
+            self._last_rotation_time = time.time()
 
-            self._last_rotation_time = current_time
-
-            # Track rotations to detect cycling
+            # Track rotations
             if not hasattr(self, "rotation_count"):
                 self.rotation_count = 0
             self.rotation_count += 1
 
-            # If we've rotated through all keys multiple times in a short period, take a break
-            if (
-                self.rotation_count >= len(self.api_keys) * 2
-                and current_time - self._last_rotation_time < 30
-            ):
-                logging.warning(
-                    "⚠️ Đã thử tất cả API keys nhiều lần. Tạm dừng 30 giây..."
-                )
-                time.sleep(30)
-                self.rotation_count = 0  # Reset counter
+            logging.info(
+                f"🔄 Đã chuyển sang API key {self.current_key_index + 1}/{len(self.api_keys)}"
+            )
 
             return True
         except Exception as e:
@@ -657,7 +832,6 @@ class PDFConverter:
                                 )
                                 break
 
-                            # Try to call API with error handling
                             try:
                                 response = self._call_gemini_api(prompt, img_processed)
 
@@ -694,7 +868,10 @@ class PDFConverter:
                                     current_page_retries[page_key] = retry_count
                             except Exception as api_err:
                                 error_msg = str(api_err)
-                                if "API_QUOTA_EXHAUSTED" in error_msg:
+                                if (
+                                    "API_QUOTA_EXHAUSTED" in error_msg
+                                    or "ALL_KEYS_EXHAUSTED" in error_msg
+                                ):
                                     logging.warning(
                                         f"⚠️ Tất cả API key đã hết quota khi xử lý trang {page_num + 1}"
                                     )
@@ -717,8 +894,9 @@ class PDFConverter:
                                     retry_count += 1
                                     current_page_retries[page_key] = retry_count
                                     if retry_count <= max_page_retries:
+                                        # Thử đổi key nếu có lỗi
                                         self.rotate_api_key()
-                                        time.sleep(2)  # Tạm dừng ngắn trước khi thử lại
+                                        time.sleep(1)  # Tạm dừng ngắn trước khi thử lại
 
                         except Exception as page_err:
                             logging.warning(

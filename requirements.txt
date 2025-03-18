@@ -7,3 +7,6 @@ PyMuPDF
 google-genai
 tenacity
 tqdm
+datasets
+huggingface-hub
+psutil
