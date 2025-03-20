@@ -1,3 +1,9 @@
 *.pyc
 /data
 api.json
+/final_data
+/logs
+/reports
+checkpoints/dedup_checkpoint_final_data.pickle
+checkpoints/dedup_summary_final_data.json
+final_data.zip

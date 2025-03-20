@@ -6,7 +6,11 @@ Pillow
 PyMuPDF
 google-genai
 tenacity
-tqdm
+tqdm>=4.64.0
 datasets
 huggingface-hub
-psutil
+psutil>=5.9.0
+datasketch>=1.5.1
+numpy>=1.20.0
+colorama>=0.4.4
+pathlib>=1.0.1
